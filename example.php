@@ -11,9 +11,9 @@ require_once __DIR__ . '/Services/LocalCache.php';
 require_once __DIR__ . '/Services/RedisConnectionPool.php';
 
 // 使用命名空间
-use GeorgeRequestCache\RequestCache;
-use GeorgeRequestCache\FilterConfig;
-use GeorgeRequestCache\CacheConfig;
+use HwlowellRequestCache\RequestCache;
+use HwlowellRequestCache\CacheConfig;
+use HwlowellRequestCache\FilterConfig;
 
 // 加载配置文件
 $config = require __DIR__ . '/config/request_cache.php';

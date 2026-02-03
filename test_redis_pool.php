@@ -2,7 +2,7 @@
 
 require __DIR__ . '/vendor/autoload.php';
 
-use GeorgeRequestCache\RequestCache;
+use HwlowellRequestCache\RequestCache;
 
 //测试 Redis 连接池功能
 echo "=== 测试 Redis 连接池功能 ===\n";

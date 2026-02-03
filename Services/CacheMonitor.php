@@ -1,6 +1,6 @@
 <?php
 
-namespace GeorgeRequestCache;
+namespace HwlowellRequestCache;
 
 use Illuminate\Support\Facades\Redis;
 

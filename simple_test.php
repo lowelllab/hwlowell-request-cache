@@ -2,7 +2,7 @@
 
 require_once __DIR__ . '/vendor/autoload.php';
 
-use GeorgeRequestCache\RequestCache;
+use HwlowellRequestCache\RequestCache;
 
 //模拟Laravel函数，避免依赖 Laravel 环境
 if (!function_exists('config')) {

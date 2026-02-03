@@ -1,5 +1,5 @@
 {
-    "name": "george/request-cache",
+    "name": "hwlowell/request-cache",
     "description": "A Laravel cache package for request caching with Redis and local cache support",
     "type": "library",
     "version": "1.0.0",
@@ -9,7 +9,7 @@
         "redis",
         "request-cache"
     ],
-    "homepage": "https://github.com/george/request-cache",
+    "homepage": "https://github.com/hwlowell/request-cache",
     "license": "MIT",
     "authors": [
         {
@@ -30,12 +30,12 @@
     },
     "autoload": {
         "psr-4": {
-            "GeorgeRequestCache\\": "Services/"
+            "HwlowellRequestCache\\": "Services/"
         }
     },
     "autoload-dev": {
         "psr-4": {
-            "GeorgeRequestCache\\Tests\\": "tests/"
+            "HwlowellRequestCache\\Tests\\": "tests/"
         }
     },
     "scripts": {
@@ -48,10 +48,10 @@
     "extra": {
         "laravel": {
             "providers": [
-                "GeorgeRequestCache\\RequestCacheServiceProvider"
+                "HwlowellRequestCache\\RequestCacheServiceProvider"
             ],
             "aliases": {
-                "RequestCache": "GeorgeRequestCache\\Facades\\RequestCache"
+                "RequestCache": "HwlowellRequestCache\\Facades\\RequestCache"
             }
         }
     },

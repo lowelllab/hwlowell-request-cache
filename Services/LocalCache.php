@@ -1,8 +1,8 @@
 <?php
 
-namespace GeorgeRequestCache;
+namespace HwlowellRequestCache;
 
-use GeorgeRequestCache\CacheConfig;
+use HwlowellRequestCache\CacheConfig;
 
 class LocalCache
 {

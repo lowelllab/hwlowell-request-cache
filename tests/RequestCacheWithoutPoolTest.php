@@ -1,10 +1,10 @@
 <?php
 
-namespace GeorgeRequestCache\Tests;
+namespace HwlowellRequestCache\Tests;
 
-use GeorgeRequestCache\RequestCache;
-use GeorgeRequestCache\LocalCache;
-use GeorgeRequestCache\CacheConfig;
+use HwlowellRequestCache\RequestCache;
+use HwlowellRequestCache\LocalCache;
+use HwlowellRequestCache\CacheConfig;
 use Illuminate\Support\Facades\Redis;
 use Mockery;
 use PHPUnit\Framework\TestCase;

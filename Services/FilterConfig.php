@@ -1,6 +1,6 @@
 <?php
 
-namespace GeorgeRequestCache;
+namespace HwlowellRequestCache;
 
 class FilterConfig
 {

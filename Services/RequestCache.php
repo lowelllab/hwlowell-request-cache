@@ -1,14 +1,14 @@
 <?php
 
-namespace GeorgeRequestCache;
+namespace HwlowellRequestCache;
 
 use Illuminate\Support\Facades\Redis;
 use Illuminate\Http\Request;
 use Illuminate\Support\Str;
-use GeorgeRequestCache\FilterConfig;
-use GeorgeRequestCache\CacheConfig;
-use GeorgeRequestCache\LocalCache;
-use GeorgeRequestCache\RedisConnectionPool;
+use HwlowellRequestCache\FilterConfig;
+use HwlowellRequestCache\CacheConfig;
+use HwlowellRequestCache\LocalCache;
+use HwlowellRequestCache\RedisConnectionPool;
 
 class RequestCache
 {

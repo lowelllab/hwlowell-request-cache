@@ -1,9 +1,9 @@
 <?php
 
-namespace GeorgeRequestCache\Tests;
+namespace HwlowellRequestCache\Tests;
 
-use GeorgeRequestCache\RequestCache;
-use GeorgeRequestCache\LocalCache;
+use HwlowellRequestCache\RequestCache;
+use HwlowellRequestCache\LocalCache;
 use Illuminate\Support\Facades\Redis;
 use Mockery;
 use PHPUnit\Framework\TestCase;
@@ -40,7 +40,7 @@ class RequestCacheTest extends TestCase
         parent::setUp();
 
         //Enable Redis connection pool
-        \GeorgeRequestCache\CacheConfig::setRedisPoolConfig(['enabled' => true]);
+        \HwlowellRequestCache\CacheConfig::setRedisPoolConfig(['enabled' => true]);
 
         //Mock Redis facade
         $this->redisMock = Mockery::mock('alias:Illuminate\\Support\\Facades\\Redis');

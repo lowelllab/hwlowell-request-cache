@@ -2,7 +2,7 @@
 
 require_once __DIR__ . '/vendor/autoload.php';
 
-use GeorgeRequestCache\RequestCache;
+use HwlowellRequestCache\RequestCache;
 
 //初始化 RequestCache 实例
 $cache = new RequestCache();

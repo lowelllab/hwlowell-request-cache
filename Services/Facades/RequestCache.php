@@ -1,6 +1,6 @@
 <?php
 
-namespace GeorgeRequestCache\Facades;
+namespace HwlowellRequestCache\Facades;
 
 use Illuminate\Support\Facades\Facade;
 
