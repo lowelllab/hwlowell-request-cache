@@ -1,0 +1,60 @@
+{
+    "name": "george/request-cache",
+    "description": "A Laravel cache package for request caching with Redis and local cache support",
+    "type": "library",
+    "version": "1.0.0",
+    "keywords": [
+        "laravel",
+        "cache",
+        "redis",
+        "request-cache"
+    ],
+    "homepage": "https://github.com/george/request-cache",
+    "license": "MIT",
+    "authors": [
+        {
+            "name": "Lowell",
+            "email": "13226431320@163.com",
+            "role": "Developer"
+        }
+    ],
+    "require": {
+        "php": ">=7.4",
+        "illuminate/support": "^8.75",
+        "illuminate/redis": "^8.75",
+        "illuminate/http": "^8.75"
+    },
+    "require-dev": {
+        "orchestra/testbench": "^6.0",
+        "phpunit/phpunit": "^9.0"
+    },
+    "autoload": {
+        "psr-4": {
+            "GeorgeRequestCache\\": "Services/"
+        }
+    },
+    "autoload-dev": {
+        "psr-4": {
+            "GeorgeRequestCache\\Tests\\": "tests/"
+        }
+    },
+    "scripts": {
+        "test": "vendor/bin/phpunit",
+        "test-coverage": "vendor/bin/phpunit --coverage-html coverage"
+    },
+    "config": {
+        "sort-packages": true
+    },
+    "extra": {
+        "laravel": {
+            "providers": [
+                "GeorgeRequestCache\\RequestCacheServiceProvider"
+            ],
+            "aliases": {
+                "RequestCache": "GeorgeRequestCache\\Facades\\RequestCache"
+            }
+        }
+    },
+    "minimum-stability": "stable",
+    "prefer-stable": true
+}
