@@ -9,7 +9,7 @@
         "redis",
         "request-cache"
     ],
-    "homepage": "https://github.com/hwlowell/request-cache",
+    "homepage": "https://github.com/lowelllab/hwlowell-request-cache",
     "license": "MIT",
     "authors": [
         {
