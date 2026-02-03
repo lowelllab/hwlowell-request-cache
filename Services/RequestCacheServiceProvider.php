@@ -14,7 +14,7 @@ class RequestCacheServiceProvider extends ServiceProvider
     public function register()
     {
         $this->app->singleton('request-cache', function ($app) {
-            return new RequestCache(config('request_cache', []));
+            return new RequestCache(config('request-cache', []));
         });
 
         $this->app->singleton('cache-monitor', function ($app) {

@@ -98,13 +98,13 @@ class RequestCache
      */
     public function __construct(array $config = null)
     {
-        // 兼容非 Laravel 环境
+        //兼容非 Laravel 环境
         $this->appName = function_exists('env') ? env('APP_NAME', 'laravel') : 'laravel';
         $this->appEnv = function_exists('env') ? env('APP_ENV', 'local') : 'local';
         $this->prefix = strtolower(str_replace(' ', '_', $this->appName)) . '_' . $this->appEnv . '_cache:';
         $this->localCache = new LocalCache();
-        $config = $config ?? (function_exists('config') ? config('request_cache') : null);
-        // 加载配置
+        $config = $config ??  config('request-cache');//托底=--特(>^ω^<)喵的一直读不到。
+        //加载配置
         if ($config !== null) {
             if (isset($config['request_cache'])) {
                 $requestCacheConfig = $config['request_cache'];
