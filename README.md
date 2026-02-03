@@ -26,7 +26,7 @@ A Laravel cache package for request caching with Redis and local cache support.
 You can install the package via composer:
 
 ```bash
-composer require george/request-cache
+composer require hwlowell/request-cache
 ```
 
 ## Configuration
@@ -34,7 +34,7 @@ composer require george/request-cache
 The package will automatically register its service provider. You can publish the configuration file if needed:
 
 ```bash
-php artisan vendor:publish --provider="GeorgeRequestCache\RequestCacheServiceProvider" --tag="config"
+php artisan vendor:publish --provider="HwlowellRequestCache\RequestCacheServiceProvider" --tag="config"
 ```
 
 ## Usage
@@ -42,7 +42,7 @@ php artisan vendor:publish --provider="GeorgeRequestCache\RequestCacheServicePro
 ### Basic Usage
 
 ```php
-use GeorgeRequestCache\RequestCache;
+use HwlowellRequestCache\RequestCache;
 
 // Create a new instance
 $cache = new RequestCache();
@@ -69,7 +69,7 @@ $cache->clearAll();
 ### Using the Decorator Pattern
 
 ```php
-use GeorgeRequestCache\RequestCache;
+use HwlowellRequestCache\RequestCache;
 
 $cache = new RequestCache();
 
@@ -95,7 +95,7 @@ $user = RequestCache::get('users', ['id' => 1]);
 ### Cache Monitoring
 
 ```php
-use GeorgeRequestCache\CacheMonitor;
+use HwlowellRequestCache\CacheMonitor;
 
 $monitor = new CacheMonitor();
 
@@ -366,7 +366,7 @@ $cache->setForceValidate(false); // 禁用
 ```php
 <?php
 
-use GeorgeRequestCache\RequestCache;
+use HwlowellRequestCache\RequestCache;
 
 // 初始化缓存
 $cache = new RequestCache([
@@ -437,7 +437,7 @@ print_r($stats);
 ```php
 <?php
 
-use GeorgeRequestCache\RequestCache;
+use HwlowellRequestCache\RequestCache;
 
 // 初始化缓存
 $cache = new RequestCache();
