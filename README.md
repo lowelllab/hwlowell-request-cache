@@ -44,25 +44,25 @@ php artisan vendor:publish --provider="HwlowellRequestCache\RequestCacheServiceP
 ```php
 use HwlowellRequestCache\RequestCache;
 
-// Create a new instance
+//Create a new instance
 $cache = new RequestCache();
 
-// Set cache
+//Set cache
 $cache->set('users', ['id' => 1], ['name' => 'John Doe'], 3600);
 
-// Get cache
+//Get cache
 $user = $cache->get('users', ['id' => 1]);
 
-// Delete cache
+//Delete cache
 $cache->delete('users', ['id' => 1]);
 
-// Clear all cache for a gateway
+//Clear all cache for a gateway
 $cache->clearGateway('users');
 
-// Clear cache by tags
+//Clear cache by tags
 $cache->clearTags(['users', 'profiles']);
 
-// Clear all cache
+//Clear all cache
 $cache->clearAll();
 ```
 
@@ -73,9 +73,9 @@ use HwlowellRequestCache\RequestCache;
 
 $cache = new RequestCache();
 
-// Cache the result of a callback
+//Cache the result of a callback
 $data = $cache->remember('users', ['id' => 1], function () {
-    // Expensive operation, e.g., API call or database query
+    //Expensive operation, e.g., API call or database query
     return User::find(1);
 }, 3600);
 ```
@@ -85,10 +85,10 @@ $data = $cache->remember('users', ['id' => 1], function () {
 ```php
 use RequestCache;
 
-// Set cache
+//Set cache
 RequestCache::set('users', ['id' => 1], ['name' => 'John Doe']);
 
-// Get cache
+//Get cache
 $user = RequestCache::get('users', ['id' => 1]);
 ```
 
@@ -99,16 +99,16 @@ use HwlowellRequestCache\CacheMonitor;
 
 $monitor = new CacheMonitor();
 
-// Get cache statistics
+//Get cache statistics
 $stats = $monitor->getStats();
 
-// Get cache key distribution
+//Get cache key distribution
 $distribution = $monitor->getKeyDistribution();
 
-// Get cache usage trend
+//Get cache usage trend
 $trend = $monitor->getTrend(7); // 7 days
 
-// Get health status
+//Get health status
 $status = $monitor->getHealthStatus();
 ```
 
@@ -119,14 +119,14 @@ $status = $monitor->getHealthStatus();
 #### 设置缓存
 
 ```php
-// 设置缓存，默认过期时间
+//设置缓存，默认过期时间
 $cache->set('user_profile', ['user_id' => 1], [
     'name' => '张三',
     'age' => 30,
     'email' => 'zhangsan@example.com'
 ]);
 
-// 设置缓存，自定义过期时间（10分钟）
+//设置缓存，自定义过期时间（10分钟）
 $cache->set('user_profile', ['user_id' => 1], [
     'name' => '张三',
     'age' => 30,
@@ -137,7 +137,7 @@ $cache->set('user_profile', ['user_id' => 1], [
 #### 获取缓存
 
 ```php
-// 获取缓存
+//获取缓存
 $userProfile = $cache->get('user_profile', ['user_id' => 1]);
 
 if ($userProfile) {
@@ -150,7 +150,7 @@ if ($userProfile) {
 #### 删除缓存
 
 ```php
-// 删除缓存
+//删除缓存
 $cache->delete('user_profile', ['user_id' => 1]);
 ```
 
@@ -159,7 +159,7 @@ $cache->delete('user_profile', ['user_id' => 1]);
 #### 批量获取缓存
 
 ```php
-// 批量获取缓存
+//批量获取缓存
 $results = $cache->mget([
     ['user_profile', ['user_id' => 1]],
     ['user_profile', ['user_id' => 2]],
@@ -178,14 +178,14 @@ foreach ($results as $index => $userProfile) {
 #### 批量设置缓存
 
 ```php
-// 批量设置缓存
+//批量设置缓存
 $results = $cache->mset([
     ['user_profile', ['user_id' => 1], ['name' => '张三', 'age' => 30], 600],
     ['user_profile', ['user_id' => 2], ['name' => '李四', 'age' => 25], 600],
     ['user_profile', ['user_id' => 3], ['name' => '王五', 'age' => 35], 600]
 ]);
 
-print_r($results); // [true, true, true]
+print_r($results); //[true, true, true]
 ```
 
 ### 3. 缓存装饰器（Remember）
@@ -193,9 +193,9 @@ print_r($results); // [true, true, true]
 缓存装饰器是一个非常实用的功能，它会先尝试从缓存获取数据，如果缓存未命中，则执行回调函数获取数据并自动存入缓存。
 
 ```php
-// 使用缓存装饰器
+//使用缓存装饰器
 $userProfile = $cache->remember('user_profile', ['user_id' => 1], function() {
-    // 这里是获取数据的逻辑，例如从数据库查询
+    //这里是获取数据的逻辑，例如从数据库查询
     echo "执行回调函数获取数据\n";
     return [
         'name' => '张三',
@@ -203,11 +203,11 @@ $userProfile = $cache->remember('user_profile', ['user_id' => 1], function() {
         'email' => 'zhangsan@example.com',
         'timestamp' => time()
     ];
-}, 10 * 60); // 10分钟过期
+}, 10 * 60); //10分钟过期
 
 echo "用户信息：" . $userProfile['name'] . " (" . date('Y-m-d H:i:s', $userProfile['timestamp']) . ")\n";
 
-// 再次调用，会从缓存获取
+//再次调用，会从缓存获取
 $userProfile = $cache->remember('user_profile', ['user_id' => 1], function() {
     echo "执行回调函数获取数据\n";
     return [
@@ -226,7 +226,7 @@ echo "用户信息：" . $userProfile['name'] . " (" . date('Y-m-d H:i:s', $user
 缓存标签可以帮助你对缓存进行分组管理，方便批量清除特定分组的缓存。
 
 ```php
-// 使用缓存标签
+//使用缓存标签
 $cache->tags('user', 'profile')->set('user_profile', ['user_id' => 1], [
     'name' => '张三',
     'age' => 30
@@ -237,10 +237,10 @@ $cache->tags('user', 'settings')->set('user_settings', ['user_id' => 1], [
     'language' => 'zh-CN'
 ]);
 
-// 清除特定标签的缓存
-$cache->clearTags('user'); // 清除所有带有 'user' 标签的缓存
-// 或者
-$cache->clearTags(['user', 'profile']); // 清除同时带有 'user' 和 'profile' 标签的缓存
+//清除特定标签的缓存
+$cache->clearTags('user'); //清除所有带有 'user' 标签的缓存
+//或者
+$cache->clearTags(['user', 'profile']); //清除同时带有 'user' 和 'profile' 标签的缓存
 ```
 
 ### 5. 缓存清除
@@ -248,35 +248,35 @@ $cache->clearTags(['user', 'profile']); // 清除同时带有 'user' 和 'profil
 #### 清除指定网关的缓存
 
 ```php
-// 清除指定网关的缓存（当前版本）
+//清除指定网关的缓存（当前版本）
 $cache->clearGateway('user_profile');
 
-// 清除指定网关的所有版本缓存
+//清除指定网关的所有版本缓存
 $cache->clearGateway('user_profile', true);
 ```
 
 #### 清除所有缓存
 
 ```php
-// 清除所有缓存（当前版本）
+//清除所有缓存（当前版本）
 $cache->clearAll(false);
 
-// 清除所有版本的缓存
+//清除所有版本的缓存
 $cache->clearAll(true);
 ```
 
 ### 6. 缓存统计
 
 ```php
-// 启用缓存统计
+//启用缓存统计
 $cache->enableStats(true);
 
-// 执行一些缓存操作
+//执行一些缓存操作
 $cache->remember('test', ['id' => 1], function() {
     return ['data' => 'test'];
 });
 
-// 获取缓存统计信息
+//获取缓存统计信息
 $stats = $cache->getStats();
 
 print_r($stats);
@@ -298,21 +298,21 @@ Array
 缓存预热可以在系统启动或低峰期预先加载缓存数据，提高系统响应速度。
 
 ```php
-// 缓存预热
+//缓存预热
 $cache->warm('user_profile', ['user_id' => 1], function() {
-    // 从数据库或其他数据源获取数据
+    //从数据库或其他数据源获取数据
     return [
         'name' => '张三',
         'age' => 30,
         'email' => 'zhangsan@example.com'
     ];
-}, 3600); // 1小时过期
+}, 3600); //1小时过期
 
-// 批量预热多个用户的缓存
+//批量预热多个用户的缓存
 $userIds = [1, 2, 3, 4, 5];
 foreach ($userIds as $userId) {
     $cache->warm('user_profile', ['user_id' => $userId], function() use ($userId) {
-        // 从数据库获取用户信息
+        //从数据库获取用户信息
         return [
             'user_id' => $userId,
             'name' => '用户' . $userId,
@@ -328,10 +328,10 @@ foreach ($userIds as $userId) {
 #### 版本控制
 
 ```php
-// 设置缓存版本
+//设置缓存版本
 $cache->version('2.0');
 
-// 生成的缓存键会包含版本信息
+//生成的缓存键会包含版本信息
 $key = $cache->generateKey('user_profile', ['user_id' => 1]);
 echo "缓存键：" . $key . "\n";
 ```
@@ -339,24 +339,24 @@ echo "缓存键：" . $key . "\n";
 #### 数据加密
 
 ```php
-// 启用/禁用数据加密
-$cache->encryptData(true); // 启用加密
-$cache->encryptData(false); // 禁用加密
+//启用/禁用数据加密
+$cache->encryptData(true); //启用加密
+$cache->encryptData(false); //禁用加密
 ```
 
 #### 缓存大小限制
 
 ```php
-// 设置缓存大小限制（512KB）
+//设置缓存大小限制（512KB）
 $cache->sizeLimit(512 * 1024);
 ```
 
 #### 强制参数校验
 
 ```php
-// 启用/禁用强制参数校验
-$cache->setForceValidate(true); // 启用
-$cache->setForceValidate(false); // 禁用
+//启用/禁用强制参数校验
+$cache->setForceValidate(true); //启用
+$cache->setForceValidate(false); //禁用
 ```
 
 ## Complete Usage Examples
@@ -368,7 +368,7 @@ $cache->setForceValidate(false); // 禁用
 
 use HwlowellRequestCache\RequestCache;
 
-// 初始化缓存
+//初始化缓存
 $cache = new RequestCache([
     'request_cache' => [
         'prefix' => 'my_app_',
@@ -378,10 +378,10 @@ $cache = new RequestCache([
     ]
 ]);
 
-// 模拟从数据库获取用户信息的函数
+//模拟从数据库获取用户信息的函数
 function getUserFromDatabase($userId) {
     echo "从数据库获取用户信息：$userId\n";
-    // 模拟数据库查询延迟
+    //模拟数据库查询延迟
     sleep(1);
     return [
         'user_id' => $userId,
@@ -392,15 +392,15 @@ function getUserFromDatabase($userId) {
     ];
 }
 
-// 使用缓存装饰器获取用户信息
+//使用缓存装饰器获取用户信息
 function getUserInfo($userId) {
     global $cache;
     return $cache->remember('user_profile', ['user_id' => $userId], function() use ($userId) {
         return getUserFromDatabase($userId);
-    }, 300); // 5分钟过期
+    }, 300); //5分钟过期
 }
 
-// 测试缓存效果
+//测试缓存效果
 echo "第一次获取用户 1 的信息：\n";
 $user1 = getUserInfo(1);
 print_r($user1);
@@ -413,12 +413,12 @@ echo "\n获取用户 2 的信息：\n";
 $user2 = getUserInfo(2);
 print_r($user2);
 
-// 获取缓存统计
+//获取缓存统计
 $stats = $cache->getStats();
 echo "\n缓存统计：\n";
 print_r($stats);
 
-// 清除用户 1 的缓存
+//清除用户 1 的缓存
 echo "\n清除用户 1 的缓存\n";
 $cache->delete('user_profile', ['user_id' => 1]);
 
@@ -426,7 +426,7 @@ echo "\n第三次获取用户 1 的信息（应该重新从数据库获取）：
 $user1Third = getUserInfo(1);
 print_r($user1Third);
 
-// 获取更新后的缓存统计
+//获取更新后的缓存统计
 $stats = $cache->getStats();
 echo "\n更新后的缓存统计：\n";
 print_r($stats);
@@ -442,10 +442,10 @@ use HwlowellRequestCache\RequestCache;
 // 初始化缓存
 $cache = new RequestCache();
 
-// 模拟从数据库获取商品列表的函数
+//从数据库获取商品列表的函数
 function getProductsFromDatabase($category, $page = 1, $pageSize = 10) {
     echo "从数据库获取商品列表：$category, 第 $page 页\n";
-    // 模拟数据库查询延迟
+    //数据库查询延迟
     sleep(1);
     
     $products = [];
@@ -468,7 +468,7 @@ function getProductsFromDatabase($category, $page = 1, $pageSize = 10) {
     ];
 }
 
-// 使用缓存装饰器获取商品列表
+//使用缓存装饰器获取商品列表
 function getProducts($category, $page = 1, $pageSize = 10) {
     global $cache;
     return $cache->tags('product', $category)->remember('product_list', [
@@ -477,10 +477,10 @@ function getProducts($category, $page = 1, $pageSize = 10) {
         'page_size' => $pageSize
     ], function() use ($category, $page, $pageSize) {
         return getProductsFromDatabase($category, $page, $pageSize);
-    }, 600); // 10分钟过期
+    }, 600); //10分钟过期
 }
 
-// 测试缓存效果
+//测试缓存效果
 echo "第一次获取电子产品列表：\n";
 $electronics = getProducts('electronics', 1, 5);
 echo "获取到 " . count($electronics['products']) . " 个商品\n";
@@ -493,16 +493,16 @@ echo "\n第二次获取电子产品列表（应该从缓存获取）：\n";
 $electronicsAgain = getProducts('electronics', 1, 5);
 echo "获取到 " . count($electronicsAgain['products']) . " 个商品\n";
 
-// 获取服装类商品
+//获取服装类商品
 echo "\n获取服装类商品列表：\n";
 $clothing = getProducts('clothing', 1, 5);
 echo "获取到 " . count($clothing['products']) . " 个商品\n";
 
-// 清除所有商品缓存
+//清除所有商品缓存
 echo "\n清除所有商品缓存\n";
 $cache->clearTags('product');
 
-// 再次获取电子产品列表
+//再次获取电子产品列表
 echo "\n第三次获取电子产品列表（应该重新从数据库获取）：\n";
 $electronicsThird = getProducts('electronics', 1, 5);
 echo "获取到 " . count($electronicsThird['products']) . " 个商品\n";
@@ -547,31 +547,31 @@ echo "获取到 " . count($electronicsThird['products']) . " 个商品\n";
 ### Cache Strategy
 
 ```php
-// In CacheConfig.php
+//In CacheConfig.php
 CacheConfig::$strategy = [
-    'primary' => 'redis', // Primary cache
-    'secondary' => 'array', // Secondary cache
-    'fallback' => true, // Enable fallback
+    'primary' => 'redis', //Primary cache
+    'secondary' => 'array', //Secondary cache
+    'fallback' => true, //Enable fallback
 ];
 ```
 
 ### Local Cache Config
 
 ```php
-// In CacheConfig.php
+//In CacheConfig.php
 CacheConfig::$localCache = [
-    'ttl' => 300, // Local cache TTL in seconds
-    'size' => 1000, // Maximum number of items in local cache
+    'ttl' => 300, //Local cache TTL in seconds
+    'size' => 1000, //Maximum number of items in local cache
 ];
 ```
 
 ### Filter Config
 
 ```php
-// In FilterConfig.php
-// Add custom filters
+//In FilterConfig.php
+//Add custom filters
 FilterConfig::addCustomFilter(function ($value) {
-    // Custom filtering logic
+    //Custom filtering logic
     return $value;
 });
 ```
@@ -585,14 +585,21 @@ The MIT License (MIT). Please see [License File](LICENSE) for more information.
 You can run the tests to ensure everything is working correctly:
 
 ```bash
-# Run tests with Redis connection pool enabled
+# Run basic tests with Redis connection pool enabled
 vendor/bin/phpunit tests/RequestCacheTest.php
 
 # Run tests with Redis connection pool disabled
 vendor/bin/phpunit tests/RequestCacheWithoutPoolTest.php
 
-# Generate coverage report
-composer test-coverage
+# Run complete tests with all features
+vendor/bin/phpunit tests/RequestCacheCompleteTest.php
+
+# Run all tests
+vendor/bin/phpunit tests/
+
+# Generate code coverage report
+vendor/bin/phpunit tests/ --coverage-html coverage
+
 ```
 
 ## Changelog
