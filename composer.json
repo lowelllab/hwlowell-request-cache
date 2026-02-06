@@ -2,7 +2,7 @@
     "name": "hwlowell/request-cache",
     "description": "A Laravel cache package for request caching with Redis and local cache support",
     "type": "library",
-    "version": "1.0.0",
+    "version": "1.0.1",
     "keywords": [
         "laravel",
         "cache",
