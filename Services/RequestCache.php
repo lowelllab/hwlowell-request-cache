@@ -9,9 +9,11 @@ use HwlowellRequestCache\FilterConfig;
 use HwlowellRequestCache\CacheConfig;
 use HwlowellRequestCache\LocalCache;
 use HwlowellRequestCache\RedisConnectionPool;
+use HwlowellRequestCache\Traits\RedisVersionAdapter;
 
 class RequestCache
 {
+    use RedisVersionAdapter;
 
     /**
      * 核心缓存类
@@ -103,6 +105,54 @@ class RequestCache
         
         //加载 CacheConfig 配置
         CacheConfig::loadFromConfig($config);
+    }
+    
+    /**
+     * 获取 Redis 版本
+     * @return string|null
+     */
+    protected function getRedisVersion()
+    {
+        if ($this->redisVersion === null) {
+            try {
+                //使用 Redis 连接池或直接使用 Redis 门面
+                $redis = $this->redisPool ?: Redis::connection();
+                $info = $redis->info();
+                if (isset($info['redis_version'])) {
+                    $this->redisVersion = $info['redis_version'];
+                    $this->redisVersionNumber = $this->parseRedisVersion($this->redisVersion);
+                }
+            } catch (\Exception $e) {
+                //Redis 异常，无法获取版本信息
+            }
+        }
+        return $this->redisVersion;
+    }
+    
+    /**
+     * 解析 Redis 版本号为数字形式
+     * @param string $version
+     * @return float
+     */
+    protected function parseRedisVersion(string $version)
+    {
+        //提取版本号的前两位，如 6.2.5 -> 6.2
+        $parts = explode('.', $version);
+        if (count($parts) >= 2) {
+            return (float)($parts[0] . '.' . $parts[1]);
+        }
+        return 0.0;
+    }
+    
+    /**
+     * 检查 Redis 版本是否大于等于指定版本
+     * @param float $version
+     * @return bool
+     */
+    protected function isRedisVersionGreaterOrEqual(float $version)
+    {
+        $this->getRedisVersion();
+        return $this->redisVersionNumber >= $version;
     }
     
     /**
@@ -271,7 +321,7 @@ class RequestCache
             //移除 SQL 语句关键字
             $sqlKeywords = FilterConfig::getSqlKeywords();
             if (!empty($sqlKeywords)) {
-                // 构建单次正则表达式，减少多次 preg_replace 调用
+                //构建单次正则表达式，减少多次 preg_replace 调用
                 $keywordsPattern = '/\b(' . implode('|', $sqlKeywords) . ')\b/i';
                 $value = preg_replace($keywordsPattern, '', $value);
             }
@@ -451,7 +501,7 @@ class RequestCache
         $keyMap = [];
         $strategy = CacheConfig::getStrategy();
         
-        // 先尝试从本地缓存获取
+        //先尝试从本地缓存获取
         foreach ($items as $index => [$gateway, $params]) {
             $key = $this->generateKey($gateway, $params);
             $localValue = $this->localCache->get($key);
@@ -466,23 +516,23 @@ class RequestCache
         // 如果有需要从 Redis 获取的键
         if (!empty($keysToGet) && $strategy['primary'] === 'redis') {
             try {
-                // 使用 Redis 连接池或直接使用 Redis 门面
+                //使用 Redis 连接池或直接使用 Redis 门面
                 $redis = $this->redisPool ?: Redis::connection();
                 $values = $redis->mget($keysToGet);
 
                 foreach ($keysToGet as $i => $key) {
                     $value = $values[$i];
                     if ($value) {
-                        // 解密数据
+                        //解密数据
                         if ($this->encryptData && function_exists('decrypt')) {
                             $value = decrypt($value);
                         }
                         $data = json_decode($value, true);
                         
-                        // 将数据同步到本地缓存
+                        //将数据同步到本地缓存
                         $this->localCache->set($key, $data);
                         
-                        // 添加到结果
+                        //添加到结果
                         if (isset($keyMap[$key])) {
                             $result[$keyMap[$key]] = $data;
                         }
@@ -565,9 +615,9 @@ class RequestCache
         $strategy = CacheConfig::getStrategy();
         
         try {
-            // 如果使用 Redis 作为主缓存，使用管道批量操作
+            //如果使用 Redis 作为主缓存，使用管道批量操作
             if ($strategy['primary'] === 'redis') {
-                // 使用 Redis 连接池或直接使用 Redis 门面
+                //使用 Redis 连接池或直接使用 Redis 门面
                 $redis = $this->redisPool ?: Redis::connection();
                 $pipeline = $redis->pipeline();
             }
@@ -600,7 +650,7 @@ class RequestCache
                     }
                 }
 
-                // 使用管道批量操作
+                //使用管道批量操作
                 if ($pipeline) {
                     $pipeline->setex($key, $expire, $jsonData);
                     
@@ -618,7 +668,7 @@ class RequestCache
                 $results[$index] = true;
             }
 
-            // 执行管道操作
+            //执行管道操作
             if ($pipeline) {
                 $pipeline->execute();
             }
@@ -649,7 +699,7 @@ class RequestCache
     {
         try {
             $key = $this->generateKey($gateway, $params);
-            // 使用 Redis 连接池或直接使用 Redis 门面
+            //使用 Redis 连接池或直接使用 Redis 门面
             $redis = $this->redisPool ?: Redis::connection();
             return $redis->del($key) > 0;
         } catch (\Exception $e) {
@@ -670,13 +720,13 @@ class RequestCache
         $cursor = '0';
 
         do {
-            // 使用 Redis 连接池或直接使用 Redis 门面
+            //使用 Redis 连接池或直接使用 Redis 门面
             $redis = $this->redisPool ?: Redis::connection();
             $result = $redis->command('SCAN', [$cursor, 'MATCH', $pattern, 'COUNT', $count]);
             $cursor = $result[0];
             $batchKeys = $result[1];
             
-            // 限制内存使用
+            //限制内存使用
             if (count($keys) + count($batchKeys) > $batchSize) {
                 break;
             }
@@ -698,14 +748,14 @@ class RequestCache
         $deleted = 0;
         $redis = $this->redisPool ?: Redis::connection();
         
-        // 分批删除
+        //分批删除
         foreach (array_chunk($keys, $batchSize) as $batch) {
             try {
                 $deleted += $redis->del($batch);
-                // 每批删除后短暂休眠，减少 Redis 压力
+                //每批删除后短暂休眠，减少 Redis 压力
                 usleep(10000); // 10ms
             } catch (\Exception $e) {
-                // 忽略删除异常
+                //忽略删除异常
             }
         }
         
@@ -735,7 +785,7 @@ class RequestCache
                 return true;
             }
 
-            // 分批删除，减少 Redis 压力
+            //分批删除，减少 Redis 压力
             $deleted = $this->batchDelete($keys);
             return $deleted > 0;
         } catch (\Exception $e) {
@@ -754,7 +804,7 @@ class RequestCache
             $tags = is_array($tags) ? $tags : func_get_args();
             $keys = [];
 
-            // 使用 Redis 连接池或直接使用 Redis 门面
+            //使用 Redis 连接池或直接使用 Redis 门面
             $redis = $this->redisPool ?: Redis::connection();
 
             foreach ($tags as $tag) {
@@ -797,7 +847,7 @@ class RequestCache
                 return true;
             }
 
-            // 分批删除，减少 Redis 压力
+            //分批删除，减少 Redis 压力
             $deleted = $this->batchDelete($keys);
             return $deleted > 0;
         } catch (\Exception $e) {
@@ -849,16 +899,16 @@ class RequestCache
         $lockValue = Str::random(32); //随机值，防止误释放
 
         try {
-            // 使用 Redis 连接池或直接使用 Redis 门面
+            //使用 Redis 连接池或直接使用 Redis 门面
             $redis = $this->redisPool ?: Redis::connection();
             
             for ($i = 0; $i < $retryTimes; $i++) {
                 if ($redis->set($lockKey, $lockValue, 'EX', $expire, 'NX')) {
                     return $lockValue;
                 }
-                // 自适应重试间隔：指数退避
+                //自适应重试间隔：指数退避
                 $currentDelay = $retryDelay * (1 << $i);
-                // 最大重试间隔限制为 1 秒
+                //最大重试间隔限制为 1 秒
                 $currentDelay = min($currentDelay, 1000000);
                 usleep($currentDelay);
             }
@@ -892,7 +942,15 @@ class RequestCache
 
             //使用 Redis 连接池或直接使用 Redis 门面
             $redis = $this->redisPool ?: Redis::connection();
-            return $redis->command('eval', [$script, 1, $lockKey, $lockValue, $expire]) > 0;
+            $this->redis = $redis;
+            
+            //使用 RedisVersionAdapter 处理版本差异
+            $keys = [$lockKey];
+            $args = [$lockValue, $expire];
+            $numKeys = count($keys);
+            
+            //调用统一的执行方法
+            return $this->executeRedisCommand('eval', [$script, array_merge($keys, $args), $numKeys]) > 0;
         } catch (\Exception $e) {
             //Redis 异常时，返回 false 表示续期失败
             return false;
@@ -921,7 +979,15 @@ class RequestCache
 
             //使用 Redis 连接池或直接使用 Redis 门面
             $redis = $this->redisPool ?: Redis::connection();
-            return $redis->command('eval', [$script, 1, $lockKey, $lockValue]) > 0;
+            $this->redis = $redis;
+            
+            //使用 RedisVersionAdapter 处理版本差异
+            $keys = [$lockKey];
+            $args = [$lockValue];
+            $numKeys = count($keys);
+            
+            //调用统一的执行方法
+            return $this->executeRedisCommand('eval', [$script, array_merge($keys, $args), $numKeys]) > 0;
         } catch (\Exception $e) {
             //Redis 异常时，返回 false 表示释放锁失败
             return false;
