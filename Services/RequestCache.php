@@ -9,11 +9,9 @@ use HwlowellRequestCache\FilterConfig;
 use HwlowellRequestCache\CacheConfig;
 use HwlowellRequestCache\LocalCache;
 use HwlowellRequestCache\RedisConnectionPool;
-use HwlowellRequestCache\Traits\RedisVersionAdapter;
 
 class RequestCache
 {
-    use RedisVersionAdapter;
 
     /**
      * 核心缓存类
@@ -25,22 +23,22 @@ class RequestCache
      * 缓存前缀
      */
     protected $prefix;
-    
+
     /**
      * 应用名称
      */
     protected $appName;
-    
+
     /**
      * 应用环境
      */
     protected $appEnv;
-    
+
     /**
      * 本地缓存实例
      */
     protected $localCache;
-    
+
     /**
      * 默认过期时间（分钟）
      */
@@ -75,25 +73,35 @@ class RequestCache
      * 缓存大小限制（字节）
      */
     protected $sizeLimit = 1048576; // 1MB
-    
+
     /**
      * Redis 连接池实例
      */
     protected $redisPool;
-    
+
     /**
      * 加载配置文件
      * @return array|null
      */
     protected function loadConfigFile()
     {
+        // 首先尝试加载 Laravel 项目根目录的配置文件
+        if (function_exists('config_path')) {
+            $configPath = config_path('request_cache.php');
+            if (file_exists($configPath)) {
+                return require $configPath;
+            }
+        }
+
+        // 然后尝试加载包内的默认配置文件
         $configPath = __DIR__ . '/../config/request_cache.php';
         if (file_exists($configPath)) {
             return require $configPath;
         }
+
         return null;
     }
-    
+
     /**
      * 从配置文件加载配置
      * @param array $config
@@ -102,123 +110,71 @@ class RequestCache
     {
         //加载 FilterConfig 配置
         FilterConfig::loadFromConfig($config);
-        
+
         //加载 CacheConfig 配置
         CacheConfig::loadFromConfig($config);
     }
-    
-    /**
-     * 获取 Redis 版本
-     * @return string|null
-     */
-    protected function getRedisVersion()
-    {
-        if ($this->redisVersion === null) {
-            try {
-                //使用 Redis 连接池或直接使用 Redis 门面
-                $redis = $this->redisPool ?: Redis::connection();
-                $info = $redis->info();
-                if (isset($info['redis_version'])) {
-                    $this->redisVersion = $info['redis_version'];
-                    $this->redisVersionNumber = $this->parseRedisVersion($this->redisVersion);
-                }
-            } catch (\Exception $e) {
-                //Redis 异常，无法获取版本信息
-            }
-        }
-        return $this->redisVersion;
-    }
-    
-    /**
-     * 解析 Redis 版本号为数字形式
-     * @param string $version
-     * @return float
-     */
-    protected function parseRedisVersion(string $version)
-    {
-        //提取版本号的前两位，如 6.2.5 -> 6.2
-        $parts = explode('.', $version);
-        if (count($parts) >= 2) {
-            return (float)($parts[0] . '.' . $parts[1]);
-        }
-        return 0.0;
-    }
-    
-    /**
-     * 检查 Redis 版本是否大于等于指定版本
-     * @param float $version
-     * @return bool
-     */
-    protected function isRedisVersionGreaterOrEqual(float $version)
-    {
-        $this->getRedisVersion();
-        return $this->redisVersionNumber >= $version;
-    }
-    
+
     /**
      * 构造函数
      * @param array $config 可选配置数组
      */
     public function __construct(array $config = null)
     {
-        //兼容非 Laravel 环境
-        $this->appName = function_exists('env') ? env('APP_NAME', 'laravel') : 'laravel';
-        $this->appEnv = function_exists('env') ? env('APP_ENV', 'local') : 'local';
+        //Laravel 环境配置
+        $this->appName = env('APP_NAME', 'laravel');
+        $this->appEnv = env('APP_ENV', 'local');
         $this->prefix = strtolower(str_replace(' ', '_', $this->appName)) . '_' . $this->appEnv . '_cache:';
         $this->localCache = new LocalCache();
-        
+
         //加载配置
         if ($config === null) {
-            if (function_exists('config')) {
-                try {
-                    $config = config('request-cache');
-                } catch (\Exception $e) {
-                    //Laravel config function exists but fails (not initialized), fall back to file
-                    $config = $this->loadConfigFile();
-                }
-            } else {
+            try {
+                $config = config('request_cache');
+            } catch (\Exception $e) {
+                //Laravel config function fails, fall back to file
                 $config = $this->loadConfigFile();
             }
         }
-        
+
         //加载配置
         if ($config !== null) {
             if (isset($config['request_cache'])) {
                 $requestCacheConfig = $config['request_cache'];
-                
-                if (isset($requestCacheConfig['prefix'])) {
+
+                if (isset($requestCacheConfig['prefix']) && $requestCacheConfig['prefix'] !== null) {
                     $this->prefix = $requestCacheConfig['prefix'];
                 }
-                
+
                 if (isset($requestCacheConfig['default_expire'])) {
                     $this->defaultExpire = $requestCacheConfig['default_expire'];
                 }
-                
+
                 if (isset($requestCacheConfig['force_validate'])) {
                     $this->forceValidate = $requestCacheConfig['force_validate'];
                 }
-                
+
                 if (isset($requestCacheConfig['enable_stats'])) {
                     $this->enableStats = $requestCacheConfig['enable_stats'];
                 }
-                
+
                 if (isset($requestCacheConfig['encrypt_data'])) {
                     $this->encryptData = $requestCacheConfig['encrypt_data'];
                 }
-                
+
                 if (isset($requestCacheConfig['version'])) {
                     $this->version = $requestCacheConfig['version'];
                 }
-                
+
                 if (isset($requestCacheConfig['size_limit'])) {
                     $this->sizeLimit = $requestCacheConfig['size_limit'];
                 }
             }
         }
 
-        //初始化 Redis 连接池（仅在 Laravel 环境中启用）
+        //初始化 Redis 连接池
         $poolConfig = CacheConfig::getRedisPoolConfig();
-        if (function_exists('config') && $poolConfig['enabled']) {
+        if ($poolConfig['enabled']) {
             $this->redisPool = RedisConnectionPool::getInstance($poolConfig);
         }
     }
@@ -349,7 +305,7 @@ class RequestCache
             foreach ($value as $key => $val) {
                 $value[$key] = $this->filterValue($val);
             }
-            
+
             //限制数组深度，防止嵌套过深
             $this->limitArrayDepth($value, 5);
         } elseif (is_numeric($value)) {
@@ -419,19 +375,14 @@ class RequestCache
 
         //使用 HMAC-SHA256 生成更安全的缓存键
         $keyData = [$this->version, $sanitizedGateway, $params];
-        //兼容非 Laravel 环境
-        if (function_exists('config')) {
-            try {
-                $hashKey =  config('app.key', 'default_cache_key') ?: 'default_cache_key';
-            } catch (\Exception $e) {
-                //Laravel config function exists but fails (not initialized), use default
-                $hashKey = 'default_cache_key';
-            }
-        } else {
+        //Laravel 环境配置
+        try {
+            $hashKey = config('app.key', 'default_cache_key') ?: 'default_cache_key';
+        } catch (\Exception $e) {
+            //Laravel config function fails, use default
             $hashKey = 'default_cache_key';
         }
         $hash = hash_hmac('sha256', json_encode($keyData), $hashKey);
-
         //在缓存 key 中包含版本信息
         return $this->prefix . $this->version . ':' . $sanitizedGateway . ':' . $hash;
     }
@@ -446,13 +397,13 @@ class RequestCache
     {
         $key = $this->generateKey($gateway, $params);
         $strategy = CacheConfig::getStrategy();
-        
+
         //尝试从本地缓存获取
         $localValue = $this->localCache->get($key);
         if ($localValue !== null) {
             return $localValue;
         }
-        
+
         //尝试从主缓存（Redis）获取
         if ($strategy['primary'] === 'redis') {
             try {
@@ -472,10 +423,10 @@ class RequestCache
                         }
                     }
                     $data = json_decode($value, true);
-                    
+
                     //将数据同步到本地缓存
                     $this->localCache->set($key, $data);
-                    
+
                     return $data;
                 }
             } catch (\Exception $e) {
@@ -500,7 +451,7 @@ class RequestCache
         $keysToGet = [];
         $keyMap = [];
         $strategy = CacheConfig::getStrategy();
-        
+
         //先尝试从本地缓存获取
         foreach ($items as $index => [$gateway, $params]) {
             $key = $this->generateKey($gateway, $params);
@@ -512,7 +463,7 @@ class RequestCache
                 $keyMap[$key] = $index;
             }
         }
-        
+
         // 如果有需要从 Redis 获取的键
         if (!empty($keysToGet) && $strategy['primary'] === 'redis') {
             try {
@@ -528,10 +479,10 @@ class RequestCache
                             $value = decrypt($value);
                         }
                         $data = json_decode($value, true);
-                        
+
                         //将数据同步到本地缓存
                         $this->localCache->set($key, $data);
-                        
+
                         //添加到结果
                         if (isset($keyMap[$key])) {
                             $result[$keyMap[$key]] = $data;
@@ -613,7 +564,7 @@ class RequestCache
         $results = [];
         $pipeline = null;
         $strategy = CacheConfig::getStrategy();
-        
+
         try {
             //如果使用 Redis 作为主缓存，使用管道批量操作
             if ($strategy['primary'] === 'redis') {
@@ -653,7 +604,7 @@ class RequestCache
                 //使用管道批量操作
                 if ($pipeline) {
                     $pipeline->setex($key, $expire, $jsonData);
-                    
+
                     //保存标签关联
                     foreach ($this->tags as $tag) {
                         $tagKey = "{$this->prefix}tags:{$tag}";
@@ -670,7 +621,7 @@ class RequestCache
 
             //执行管道操作
             if ($pipeline) {
-                $pipeline->execute();
+                $pipeline->exec();
             }
         } catch (\Exception $e) {
             //Redis 异常时，尝试使用本地缓存作为回退
@@ -719,18 +670,31 @@ class RequestCache
         $keys = [];
         $cursor = '0';
 
+        // Get Redis prefix from config
+        try {
+            $redisPrefix = config('database.redis.options.prefix', '');
+        } catch (\Exception $e) {
+            $redisPrefix = '';
+        }
+
         do {
             //使用 Redis 连接池或直接使用 Redis 门面
             $redis = $this->redisPool ?: Redis::connection();
-            $result = $redis->command('SCAN', [$cursor, 'MATCH', $pattern, 'COUNT', $count]);
+            $fullPattern = $redisPrefix . $pattern;
+            $result = $redis->scan($cursor, ['match' => $fullPattern, 'count' => $count]);
+
+            if ($result === false) {
+                break;
+            }
+
             $cursor = $result[0];
             $batchKeys = $result[1];
-            
+
             //限制内存使用
             if (count($keys) + count($batchKeys) > $batchSize) {
                 break;
             }
-            
+
             $keys = array_merge($keys, $batchKeys);
         } while ($cursor != '0');
 
@@ -747,18 +711,30 @@ class RequestCache
     {
         $deleted = 0;
         $redis = $this->redisPool ?: Redis::connection();
-        
+
+        // Get Redis prefix from config
+        try {
+            $redisPrefix = config('database.redis.options.prefix', '');
+        } catch (\Exception $e) {
+            $redisPrefix = '';
+        }
+
         //分批删除
         foreach (array_chunk($keys, $batchSize) as $batch) {
             try {
-                $deleted += $redis->del($batch);
+                // Remove Redis prefix from keys if present
+                $batchWithoutPrefix = $redisPrefix ? array_map(function($key) use ($redisPrefix) {
+                    return preg_replace('/^' . preg_quote($redisPrefix, '/') . '/', '', $key);
+                }, $batch) : $batch;
+
+                $deleted += $redis->del($batchWithoutPrefix);
                 //每批删除后短暂休眠，减少 Redis 压力
                 usleep(10000); // 10ms
             } catch (\Exception $e) {
                 //忽略删除异常
             }
         }
-        
+
         return $deleted;
     }
 
@@ -778,13 +754,10 @@ class RequestCache
                 //只清除当前版本的缓存
                 $pattern = $this->prefix . $this->version . ':' . $gateway . ':*';
             }
-
             $keys = $this->scanKeys($pattern);
-
             if (empty($keys)) {
                 return true;
             }
-
             //分批删除，减少 Redis 压力
             $deleted = $this->batchDelete($keys);
             return $deleted > 0;
@@ -901,7 +874,7 @@ class RequestCache
         try {
             //使用 Redis 连接池或直接使用 Redis 门面
             $redis = $this->redisPool ?: Redis::connection();
-            
+
             for ($i = 0; $i < $retryTimes; $i++) {
                 if ($redis->set($lockKey, $lockValue, 'EX', $expire, 'NX')) {
                     return $lockValue;
@@ -942,15 +915,9 @@ class RequestCache
 
             //使用 Redis 连接池或直接使用 Redis 门面
             $redis = $this->redisPool ?: Redis::connection();
-            $this->redis = $redis;
-            
-            //使用 RedisVersionAdapter 处理版本差异
-            $keys = [$lockKey];
-            $args = [$lockValue, $expire];
-            $numKeys = count($keys);
-            
-            //调用统一的执行方法
-            return $this->executeRedisCommand('eval', [$script, array_merge($keys, $args), $numKeys]) > 0;
+
+            //直接执行 eval 命令
+            return $redis->eval($script, 1, $lockKey, $lockValue, $expire) > 0;
         } catch (\Exception $e) {
             //Redis 异常时，返回 false 表示续期失败
             return false;
@@ -979,15 +946,9 @@ class RequestCache
 
             //使用 Redis 连接池或直接使用 Redis 门面
             $redis = $this->redisPool ?: Redis::connection();
-            $this->redis = $redis;
-            
-            //使用 RedisVersionAdapter 处理版本差异
-            $keys = [$lockKey];
-            $args = [$lockValue];
-            $numKeys = count($keys);
-            
-            //调用统一的执行方法
-            return $this->executeRedisCommand('eval', [$script, array_merge($keys, $args), $numKeys]) > 0;
+
+            //直接执行 eval 命令
+            return $redis->eval($script, 1, $lockKey, $lockValue) > 0;
         } catch (\Exception $e) {
             //Redis 异常时，返回 false 表示释放锁失败
             return false;
@@ -1055,7 +1016,7 @@ class RequestCache
             $today = date('Y-m-d');
             //使用 Redis 连接池或直接使用 Redis 门面
             $redis = $this->redisPool ?: Redis::connection();
-            
+
             $stats = [
                 'hits' => (int) $redis->get("{$this->prefix}stats:hits") ?? 0,
                 'misses' => (int) $redis->get("{$this->prefix}stats:misses") ?? 0,
