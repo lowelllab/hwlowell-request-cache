@@ -104,4 +104,7 @@ return [
             'health_check_interval' => 60, //健康检查间隔（秒）
         ],
     ],
+    'redis_search' => [
+        'index_name' => env('APP_ENV').'_request_cache', //索引名称前缀
+    ],
 ];

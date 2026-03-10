@@ -85,18 +85,22 @@ class RequestCache
      */
     protected function loadConfigFile()
     {
-        // 首先尝试加载 Laravel 项目根目录的配置文件
-        if (function_exists('config_path')) {
-            $configPath = config_path('request_cache.php');
-            if (file_exists($configPath)) {
-                return require $configPath;
-            }
-        }
-
-        // 然后尝试加载包内的默认配置文件
+        // 首先尝试加载包内的默认配置文件
         $configPath = __DIR__ . '/../config/request_cache.php';
         if (file_exists($configPath)) {
             return require $configPath;
+        }
+
+        // 然后尝试加载 Laravel 项目根目录的配置文件
+        if (function_exists('config_path')) {
+            try {
+                $configPath = config_path('request_cache.php');
+                if (file_exists($configPath)) {
+                    return require $configPath;
+                }
+            } catch (\Exception $e) {
+                // 忽略错误
+            }
         }
 
         return null;
@@ -132,7 +136,6 @@ class RequestCache
             try {
                 $config = config('request_cache');
             } catch (\Exception $e) {
-                //Laravel config function fails, fall back to file
                 $config = $this->loadConfigFile();
             }
         }
@@ -1053,5 +1056,154 @@ class RequestCache
         $data = $callback();
         $this->set($gateway, $params, $data, $expire);
         return $data;
+    }
+
+    /**
+     * 索引文档到 RediSearch
+     * @param string $id
+     * @param array $document
+     * @return bool
+     */
+    public function indexSearch($id, array $document)
+    {
+        try {
+            $searchService = \HwlowellRequestCache\RediSearchService::getInstance();
+            return $searchService->index($id, $document);
+        } catch (\Exception $e) {
+            return false;
+        }
+    }
+
+    /**
+     * 搜索缓存内容
+     * @param string $query
+     * @param array $options
+     * @return array
+     */
+    public function search($query, array $options = [])
+    {
+        try {
+            $searchService = \HwlowellRequestCache\RediSearchService::getInstance();
+            return $searchService->search($query, $options);
+        } catch (\Exception $e) {
+            return [];
+        }
+    }
+
+    /**
+     * 从搜索索引中删除文档
+     * @param string $id
+     * @return bool
+     */
+    public function deleteSearch($id)
+    {
+        try {
+            $searchService = \HwlowellRequestCache\RediSearchService::getInstance();
+            return $searchService->delete($id);
+        } catch (\Exception $e) {
+            return false;
+        }
+    }
+
+    /**
+     * 清除搜索索引
+     * @return bool
+     */
+    public function clearSearch()
+    {
+        try {
+            $searchService = \HwlowellRequestCache\RediSearchService::getInstance();
+            return $searchService->clear();
+        } catch (\Exception $e) {
+            return false;
+        }
+    }
+
+    /**
+     * 高级搜索
+     * @param array $conditions
+     * @param array $options
+     * @return array
+     */
+    public function advancedSearch(array $conditions, array $options = [])
+    {
+        try {
+            $searchService = \HwlowellRequestCache\RediSearchService::getInstance();
+            return $searchService->advancedSearch($conditions, $options);
+        } catch (\Exception $e) {
+            return [];
+        }
+    }
+
+    /**
+     * 批量索引文档
+     * @param array $documents
+     * @return mixed
+     */
+    public function bulkIndexSearch(array $documents)
+    {
+        try {
+            $searchService = \HwlowellRequestCache\RediSearchService::getInstance();
+            return $searchService->bulkIndex($documents);
+        } catch (\Exception $e) {
+            return false;
+        }
+    }
+
+    /**
+     * 批量删除文档
+     * @param array $ids
+     * @return mixed
+     */
+    public function bulkDeleteSearch(array $ids)
+    {
+        try {
+            $searchService = \HwlowellRequestCache\RediSearchService::getInstance();
+            return $searchService->bulkDelete($ids);
+        } catch (\Exception $e) {
+            return false;
+        }
+    }
+
+    /**
+     * 获取搜索文档数量
+     * @return int
+     */
+    public function countSearchDocuments()
+    {
+        try {
+            $searchService = \HwlowellRequestCache\RediSearchService::getInstance();
+            return $searchService->countDocuments();
+        } catch (\Exception $e) {
+            return 0;
+        }
+    }
+
+    /**
+     * 检查搜索索引是否存在
+     * @return bool
+     */
+    public function existSearchIndex()
+    {
+        try {
+            $searchService = \HwlowellRequestCache\RediSearchService::getInstance();
+            return $searchService->existIndex();
+        } catch (\Exception $e) {
+            return false;
+        }
+    }
+
+    /**
+     * 重建搜索索引
+     * @return mixed
+     */
+    public function rebuildSearchIndex()
+    {
+        try {
+            $searchService = \HwlowellRequestCache\RediSearchService::getInstance();
+            return $searchService->rebuildIndex();
+        } catch (\Exception $e) {
+            return false;
+        }
     }
 }
