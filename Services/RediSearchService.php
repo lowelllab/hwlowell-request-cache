@@ -340,7 +340,7 @@ class RediSearchService
         $options['limit'] = $perPage;
         $options['offset'] = $offset;
 
-        $results = $this->search($query, $options);
+        $results = $this->advancedSearchRaw($query, $options);
         $total = $this->countDocuments();
         $totalPages = ceil($total / $perPage);
 
@@ -360,10 +360,10 @@ class RediSearchService
      */
     public function searchWithFuzzy($query, array $options = [])
     {
-        $query = preg_replace('/[^a-zA-Z0-9]/', '', $query);
+        //$query = preg_replace('/[^a-zA-Z0-9]/', '', $query);
         //在查询前添加 ~ 符号启用模糊搜索
         $fuzzyQuery = $query . '~';
-        return $this->search($fuzzyQuery, $options);
+        return $this->advancedSearchRaw($fuzzyQuery, $options);
     }
 
     /**
@@ -371,10 +371,10 @@ class RediSearchService
      */
     public function searchWithPrefix($prefix, array $options = [])
     {
-        $prefix = preg_replace('/[^a-zA-Z0-9]/', '', $prefix);
+        //$prefix = preg_replace('/[^a-zA-Z0-9]/', '', $prefix);
         //在查询后添加 * 符号启用前缀搜索
         $prefixQuery = $prefix . '*';
-        return $this->search($prefixQuery, $options);
+        return $this->advancedSearchRaw($prefixQuery, $options);
     }
 
     /**
@@ -385,8 +385,8 @@ class RediSearchService
         $searchBuilder = $this->engine->createSearchBuilder($this->getIndexName());
         //为每个关键词添加搜索条件
         foreach ($queries as $query) {
-            //清除$query所有空格及特殊字符
-            $query = preg_replace('/[^a-zA-Z0-9]/', '', $query);
+            //清除$query特殊字符，保留空格
+            $query = preg_replace('/[^a-zA-Z0-9\s]/', '', $query);
             $searchBuilder->addFilter(new \CmsIg\Seal\Search\Condition\SearchCondition($query));
         }
 
