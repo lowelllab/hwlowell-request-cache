@@ -58,6 +58,16 @@ class CacheConfig
     ];
     
     /**
+     * RediSearch 配置
+     */
+    public static $redisSearch = [
+        'enabled' => true, // 启用 RediSearch
+        'index_name' => 'request_cache_index', // 索引名称
+        'max_results' => 1000, // 最大搜索结果数
+        'timeout_ms' => 500, // 搜索超时时间（毫秒）
+    ];
+    
+    /**
      * 从配置文件加载配置
      * @param array $config
      */
@@ -84,6 +94,10 @@ class CacheConfig
             
             if (isset($cacheConfig['redis_pool'])) {
                 self::$redisPool = array_merge(self::$redisPool, $cacheConfig['redis_pool']);
+            }
+            
+            if (isset($cacheConfig['redis_search'])) {
+                self::$redisSearch = array_merge(self::$redisSearch, $cacheConfig['redis_search']);
             }
         }
     }
@@ -176,5 +190,23 @@ class CacheConfig
     public static function setRedisPoolConfig(array $config)
     {
         self::$redisPool = array_merge(self::$redisPool, $config);
+    }
+    
+    /**
+     * 获取 RediSearch 配置
+     * @return array
+     */
+    public static function getRediSearchConfig()
+    {
+        return self::$redisSearch;
+    }
+    
+    /**
+     * 设置 RediSearch 配置
+     * @param array $config
+     */
+    public static function setRediSearchConfig(array $config)
+    {
+        self::$redisSearch = array_merge(self::$redisSearch, $config);
     }
 }

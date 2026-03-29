@@ -22,7 +22,7 @@ class FilterConfig
      * 保留的字符正则表达式
      */
     public static $allowedCharsPattern;
-    
+
     /**
      * 初始化
      */
@@ -37,7 +37,7 @@ class FilterConfig
             self::$allowedCharsPattern = '/[^\w\u4e00-\u9fa5]/u';
         }
     }
-    
+
     /**
      * 从配置文件加载配置
      * @param array $config
@@ -46,25 +46,25 @@ class FilterConfig
     {
         if (isset($config['filter'])) {
             $filterConfig = $config['filter'];
-            
+
             if (isset($filterConfig['sql_keywords'])) {
                 self::$sqlKeywords = $filterConfig['sql_keywords'];
             }
-            
+
             if (isset($filterConfig['remove_html_tags'])) {
                 self::$removeHtmlTags = $filterConfig['remove_html_tags'];
             }
-            
+
             if (isset($filterConfig['trim_whitespace'])) {
                 self::$trimWhitespace = $filterConfig['trim_whitespace'];
             }
-            
+
             if (isset($filterConfig['custom_filters'])) {
                 self::$customFilters = $filterConfig['custom_filters'];
             }
         }
     }
-    
+
     /**
      * 静态构造函数
      */
@@ -72,7 +72,7 @@ class FilterConfig
     {
         self::init();
     }
-    
+
     /**
      * 调用静态方法时自动初始化
      */
@@ -100,14 +100,6 @@ class FilterConfig
      */
     public static $customFilters = [];
 
-    /**
-     * 添加自定义过滤规则
-     * @param callable $filter
-     */
-    public static function addCustomFilter(callable $filter)
-    {
-        self::$customFilters[] = $filter;
-    }
 
     /**
      * 获取所有 SQL 关键字
