@@ -33,6 +33,7 @@ if (!$engine->existIndex('products')) {
     }
 }
 //保存文档到索引
+$engine = app('CmsIg\Seal\EngineInterface');
 $task = $engine->saveDocument('products', $document);
 $searchQuery = $engine->createSearchBuilder('products')
             ->addFilter(Condition::search('12530'))
