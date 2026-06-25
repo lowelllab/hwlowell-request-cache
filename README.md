@@ -72,6 +72,15 @@ return [
 ];
 ```
 
+`redis_cluster` 配置项说明：
+
+- `enabled`：是否启用 Redis Cluster 兼容模式。启用后，包会在生成缓存 key、标签 key、统计 key 和锁 key 时使用统一 hash tag，让相关 key 尽量落在同一个 slot，降低 `CROSSSLOT` 风险。
+- `hash_tag`：Redis Cluster hash tag 名称。设置为 `request-cache` 时，生成的 key 会包含类似 `{request-cache}` 的片段；为空时会使用默认的 `app_env_cache` 形式，避免不同应用或环境之间 key 冲突。
+- `cluster_safe_mode`：是否启用集群安全模式。启用后，涉及多个 key 的操作会降级为逐 key 操作，例如 `mget`、`mset`、标签清理和批量删除，从而避免 Redis Cluster 不允许跨 slot 多 key 命令的问题。
+- `scan_strategy`：控制基于 SCAN 的清理和监控范围。默认 `single_connection` 只处理当前 Redis 连接；设置为 `all_nodes` 时，会读取宿主 Laravel 项目的 `database.redis.clusters` 节点配置，并尝试遍历所有集群节点。
+
+`redis_cluster` 只控制本包的 Redis Cluster 兼容行为，不负责定义 Redis Cluster 节点。Redis 连接和节点列表仍应配置在 Laravel 项目的 `config/database.php` 中。
+
 `scan_strategy` 用于控制基于 SCAN 的清理与监控范围：
 
 - `single_connection`：默认策略，只扫描当前 Redis 连接，并只返回当前连接视角的监控数据。
@@ -84,6 +93,18 @@ return [
 - `cluster_partial`：至少一个节点失败，结果为部分聚合视角。
 
 本包不维护独立 Redis Cluster 节点列表。需要全节点清理或聚合监控时，请在宿主 Laravel 项目的 `database.redis.clusters` 中配置节点，并设置 `scan_strategy => 'all_nodes'`。
+
+宿主 Laravel 项目的 Redis Cluster 节点配置示例：
+
+```php
+'clusters' => [
+    'default' => [
+        ['host' => env('REDIS_CLUSTER_HOST_1'), 'port' => env('REDIS_CLUSTER_PORT_1', 6379)],
+        ['host' => env('REDIS_CLUSTER_HOST_2'), 'port' => env('REDIS_CLUSTER_PORT_2', 6379)],
+        ['host' => env('REDIS_CLUSTER_HOST_3'), 'port' => env('REDIS_CLUSTER_PORT_3', 6379)],
+    ],
+],
+```
 
 严格多实例部署推荐配置：
 
