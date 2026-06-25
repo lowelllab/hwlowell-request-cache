@@ -68,6 +68,7 @@ return [
             'primary' => 'redis', //主缓存
             'secondary' => 'array', //备用缓存
             'fallback' => true, //启用降级
+            'shared_mode' => false, //共享模式：Redis 写失败时禁止写入本地缓存并返回成功
         ],
 
         //本地缓存配置
@@ -103,8 +104,16 @@ return [
             'idle_timeout' => 30, //空闲超时时间（秒）
             'health_check_interval' => 60, //健康检查间隔（秒）
         ],
+
+        //Redis Cluster 原生分片兼容配置
+        'redis_cluster' => [
+            'enabled' => false, //启用后使用 Redis hash tag 规避 CROSSSLOT
+            'hash_tag' => null, //为空时自动使用 appName_appEnv_cache
+            'cluster_safe_mode' => true, //多 key 操作逐 key 兜底
+            'scan_strategy' => 'single_connection', //single_connection=当前连接扫描；all_nodes=遍历 Laravel Redis Cluster 配置中的节点扫描
+        ],
     ],
     'redis_search' => [
-        'index_name' => env('APP_ENV').'_request_cache', //索引名称前缀
+        'index_name' => (function_exists('env') ? env('APP_ENV', 'local') : (getenv('APP_ENV') ?: 'local')).'_request_cache', //索引名称前缀
     ],
 ];

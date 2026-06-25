@@ -80,6 +80,11 @@ class RequestCache
     protected $redisPool;
 
     /**
+     * Redis Cluster 节点解析器
+     */
+    protected $clusterNodeResolver;
+
+    /**
      * 加载配置文件
      * @return array|null
      */
@@ -120,66 +125,138 @@ class RequestCache
     }
 
     /**
+     * 读取环境变量，兼容非 Laravel 运行环境
+     * @param string $key
+     * @param mixed $default
+     * @return mixed
+     */
+    protected static function envValue(string $key, $default = null)
+    {
+        if (function_exists('env')) {
+            return env($key, $default);
+        }
+
+        $value = getenv($key);
+        return $value === false ? $default : $value;
+    }
+
+    /**
+     * 根据配置解析缓存前缀
+     * @param array|null $config
+     * @return string
+     */
+    public static function resolvePrefix(array $config = null)
+    {
+        if ($config === null && function_exists('config')) {
+            try {
+                $config = config('request_cache', []);
+            } catch (\Exception $e) {
+                $config = [];
+            }
+        }
+
+        $appName = self::envValue('APP_NAME', 'laravel');
+        $appEnv = self::envValue('APP_ENV', 'local');
+        $defaultPrefix = strtolower(str_replace(' ', '_', $appName)) . '_' . $appEnv . '_cache:';
+        $prefix = $config['request_cache']['prefix'] ?? $defaultPrefix;
+        $clusterConfig = $config['cache']['redis_cluster'] ?? CacheConfig::getRedisClusterConfig();
+
+        if (!empty($clusterConfig['enabled'])) {
+            return self::prefixWithHashTag($prefix, $clusterConfig, $defaultPrefix);
+        }
+
+        return $prefix;
+    }
+
+    /**
+     * 为 Redis Cluster 前缀增加 hash tag
+     * @param string $prefix
+     * @param array $clusterConfig
+     * @param string $defaultPrefix
+     * @return string
+     */
+    protected static function prefixWithHashTag(string $prefix, array $clusterConfig, string $defaultPrefix)
+    {
+        if (preg_match('/\{[^{}]+\}/', $prefix)) {
+            return $prefix;
+        }
+
+        $hashTag = $clusterConfig['hash_tag'] ?? null;
+        if ($hashTag === null || $hashTag === '') {
+            $hashTag = rtrim($defaultPrefix, ':');
+        }
+
+        $hashTag = preg_replace('/[^a-zA-Z0-9_\-:]/', '_', $hashTag);
+        return '{' . $hashTag . '}:';
+    }
+
+    /**
      * 构造函数
      * @param array $config 可选配置数组
      */
     public function __construct(array $config = null)
     {
-        //Laravel 环境配置
-        $this->appName = env('APP_NAME', 'laravel');
-        $this->appEnv = env('APP_ENV', 'local');
-        $this->prefix = strtolower(str_replace(' ', '_', $this->appName)) . '_' . $this->appEnv . '_cache:';
-        $this->localCache = new LocalCache();
-
         //加载配置
         if ($config === null) {
             try {
-                $config = config('request_cache');
+                $config = config('request_cache', []);
             } catch (\Exception $e) {
                 $config = $this->loadConfigFile();
             }
         }
 
+        $config = $config ?? [];
+        self::loadConfig($config);
+
+        //Laravel 环境配置
+        $this->appName = self::envValue('APP_NAME', 'laravel');
+        $this->appEnv = self::envValue('APP_ENV', 'local');
+        $this->prefix = self::resolvePrefix($config);
+
         //加载配置
-        if ($config !== null) {
-            if (isset($config['request_cache'])) {
-                $requestCacheConfig = $config['request_cache'];
+        if (isset($config['request_cache'])) {
+            $requestCacheConfig = $config['request_cache'];
 
-                if (isset($requestCacheConfig['prefix']) && $requestCacheConfig['prefix'] !== null) {
-                    $this->prefix = $requestCacheConfig['prefix'];
-                }
+            if (isset($requestCacheConfig['default_expire'])) {
+                $this->defaultExpire = $requestCacheConfig['default_expire'];
+            }
 
-                if (isset($requestCacheConfig['default_expire'])) {
-                    $this->defaultExpire = $requestCacheConfig['default_expire'];
-                }
+            if (isset($requestCacheConfig['force_validate'])) {
+                $this->forceValidate = $requestCacheConfig['force_validate'];
+            }
 
-                if (isset($requestCacheConfig['force_validate'])) {
-                    $this->forceValidate = $requestCacheConfig['force_validate'];
-                }
+            if (isset($requestCacheConfig['enable_stats'])) {
+                $this->enableStats = $requestCacheConfig['enable_stats'];
+            } else {
+                $statsConfig = CacheConfig::getStatsConfig();
+                $this->enableStats = !empty($statsConfig['enabled']);
+            }
 
-                if (isset($requestCacheConfig['enable_stats'])) {
-                    $this->enableStats = $requestCacheConfig['enable_stats'];
-                }
+            if (isset($requestCacheConfig['encrypt_data'])) {
+                $this->encryptData = $requestCacheConfig['encrypt_data'];
+            }
 
-                if (isset($requestCacheConfig['encrypt_data'])) {
-                    $this->encryptData = $requestCacheConfig['encrypt_data'];
-                }
+            if (isset($requestCacheConfig['version'])) {
+                $this->version = $requestCacheConfig['version'];
+            }
 
-                if (isset($requestCacheConfig['version'])) {
-                    $this->version = $requestCacheConfig['version'];
-                }
-
-                if (isset($requestCacheConfig['size_limit'])) {
-                    $this->sizeLimit = $requestCacheConfig['size_limit'];
-                }
+            if (isset($requestCacheConfig['size_limit'])) {
+                $this->sizeLimit = $requestCacheConfig['size_limit'];
             }
         }
+
+        $this->localCache = new LocalCache();
 
         //初始化 Redis 连接池
         $poolConfig = CacheConfig::getRedisPoolConfig();
         if ($poolConfig['enabled']) {
             $this->redisPool = RedisConnectionPool::getInstance($poolConfig);
         }
+
+        $this->clusterNodeResolver = new RedisClusterNodeResolver(
+            CacheConfig::getRedisClusterConfig(),
+            $this->redisPool ?: null
+        );
     }
 
     /**
@@ -250,6 +327,115 @@ class RequestCache
     {
         $this->sizeLimit = $sizeLimit;
         return $this;
+    }
+
+    /**
+     * 构建标签集合 key
+     * @param string $tag
+     * @return string
+     */
+    protected function buildTagKey(string $tag)
+    {
+        return "{$this->prefix}tags:{$tag}";
+    }
+
+    /**
+     * 构建统计 key
+     * @param string $type
+     * @param string|null $date
+     * @return string
+     */
+    protected function buildStatsKey(string $type, string $date = null)
+    {
+        return $date === null
+            ? "{$this->prefix}stats:{$type}"
+            : "{$this->prefix}stats:{$type}:{$date}";
+    }
+
+    /**
+     * 构建分布式锁 key
+     * @param string $key
+     * @return string
+     */
+    protected function buildLockKey(string $key)
+    {
+        return "{$this->prefix}lock:" . hash('sha256', $key);
+    }
+
+    /**
+     * 是否启用 Redis Cluster 安全兜底
+     * @return bool
+     */
+    protected function isClusterSafeMode()
+    {
+        $clusterConfig = CacheConfig::getRedisClusterConfig();
+        return !empty($clusterConfig['enabled']) && !empty($clusterConfig['cluster_safe_mode']);
+    }
+
+    /**
+     * 是否允许 Redis 写失败后写入本地缓存兜底
+     * @return bool
+     */
+    protected function allowsLocalFallbackWrite(): bool
+    {
+        $strategy = CacheConfig::getStrategy();
+        return !empty($strategy['fallback']) && empty($strategy['shared_mode']);
+    }
+
+    /**
+     * 判断异常是否来自 Redis Cluster 跨 slot
+     * @param \Throwable $e
+     * @return bool
+     */
+    protected function isCrossSlotException(\Throwable $e)
+    {
+        return stripos($e->getMessage(), 'CROSSSLOT') !== false;
+    }
+
+    /**
+     * 解码 Redis 中存储的缓存值
+     * @param mixed $value
+     * @return mixed
+     */
+    protected function decodeStoredValue($value)
+    {
+        if (!$value) {
+            return null;
+        }
+
+        $originalValue = $value;
+        if ($this->encryptData && function_exists('decrypt')) {
+            try {
+                $value = decrypt($value);
+            } catch (\Exception $e) {
+                //解密失败，使用原始值
+                $value = $originalValue;
+            }
+        }
+
+        return json_decode($value, true);
+    }
+
+    /**
+     * 编码即将写入 Redis 的缓存值
+     * @param mixed $data
+     * @return string|false
+     */
+    protected function encodeStoredValue($data)
+    {
+        $jsonData = json_encode($data);
+        if ($jsonData === false || strlen($jsonData) > $this->sizeLimit) {
+            return false;
+        }
+
+        if ($this->encryptData && function_exists('encrypt')) {
+            $jsonData = encrypt($jsonData);
+            if (strlen($jsonData) > $this->sizeLimit) {
+                return false;
+            }
+        }
+
+        return $jsonData;
     }
 
     /**
@@ -415,17 +601,7 @@ class RequestCache
                 $value = $redis->get($key);
 
                 if ($value) {
-                    //解密数据
-                    $originalValue = $value;
-                    if ($this->encryptData && function_exists('decrypt')) {
-                        try {
-                            $value = decrypt($value);
-                        } catch (\Exception $e) {
-                            //解密失败，使用原始值
-                            $value = $originalValue;
-                        }
-                    }
-                    $data = json_decode($value, true);
+                    $data = $this->decodeStoredValue($value);
 
                     //将数据同步到本地缓存
                     $this->localCache->set($key, $data);
@@ -472,16 +648,16 @@ class RequestCache
             try {
                 //使用 Redis 连接池或直接使用 Redis 门面
                 $redis = $this->redisPool ?: Redis::connection();
-                $values = $redis->mget($keysToGet);
+                $values = $this->isClusterSafeMode()
+                    ? array_map(function ($key) use ($redis) {
+                        return $redis->get($key);
+                    }, $keysToGet)
+                    : $redis->mget($keysToGet);
 
                 foreach ($keysToGet as $i => $key) {
                     $value = $values[$i];
                     if ($value) {
-                        //解密数据
-                        if ($this->encryptData && function_exists('decrypt')) {
-                            $value = decrypt($value);
-                        }
-                        $data = json_decode($value, true);
+                        $data = $this->decodeStoredValue($value);
 
                         //将数据同步到本地缓存
                         $this->localCache->set($key, $data);
@@ -493,7 +669,27 @@ class RequestCache
                     }
                 }
             } catch (\Exception $e) {
-                //Redis 异常，忽略
+                if (!$this->isCrossSlotException($e)) {
+                    return $result;
+                }
+
+                foreach ($keysToGet as $key) {
+                    try {
+                        $redis = $this->redisPool ?: Redis::connection();
+                        $value = $redis->get($key);
+                        if (!$value) {
+                            continue;
+                        }
+
+                        $data = $this->decodeStoredValue($value);
+                        $this->localCache->set($key, $data);
+                        if (isset($keyMap[$key])) {
+                            $result[$keyMap[$key]] = $data;
+                        }
+                    } catch (\Exception $ignored) {
+                        //忽略单 key 读取异常
+                    }
+                }
             }
         }
 
@@ -513,23 +709,9 @@ class RequestCache
         try {
             $key = $this->generateKey($gateway, $params);
             $expire = $expire ?? $this->defaultExpire * 60;
-            $jsonData = json_encode($data);
-
-            //检查数据大小
-            $dataSize = strlen($jsonData);
-            if ($dataSize > $this->sizeLimit) {
-                //数据过大，不缓存
+            $jsonData = $this->encodeStoredValue($data);
+            if ($jsonData === false) {
                 return false;
-            }
-
-            //加密数据
-            if ($this->encryptData && function_exists('encrypt')) {
-                $jsonData = encrypt($jsonData);
-                //再次检查加密后的数据大小
-                if (strlen($jsonData) > $this->sizeLimit) {
-                    //加密后数据过大，不缓存
-                    return false;
-                }
             }
 
             // 使用 Redis 连接池或直接使用 Redis 门面
@@ -538,7 +720,7 @@ class RequestCache
 
             //保存标签关联
             foreach ($this->tags as $tag) {
-                $tagKey = "{$this->prefix}tags:{$tag}";
+                $tagKey = $this->buildTagKey($tag);
                 $redis->sadd($tagKey, $key);
                 //为标签设置过期时间，防止内存泄漏
                 $redis->expire($tagKey, $expire + 3600);
@@ -552,6 +734,11 @@ class RequestCache
             //Redis 异常时，尝试使用本地缓存作为回退
             $key = $this->generateKey($gateway, $params);
             $expire = $expire ?? $this->defaultExpire * 60;
+
+            if (!$this->allowsLocalFallbackWrite()) {
+                return false;
+            }
+
             $this->localCache->set($key, $data, $expire);
             return true;
         }
@@ -566,11 +753,12 @@ class RequestCache
     {
         $results = [];
         $pipeline = null;
+        $localWrites = [];
         $strategy = CacheConfig::getStrategy();
 
         try {
             //如果使用 Redis 作为主缓存，使用管道批量操作
-            if ($strategy['primary'] === 'redis') {
+            if ($strategy['primary'] === 'redis' && !$this->isClusterSafeMode()) {
                 //使用 Redis 连接池或直接使用 Redis 门面
                 $redis = $this->redisPool ?: Redis::connection();
                 $pipeline = $redis->pipeline();
@@ -583,25 +771,10 @@ class RequestCache
                 $expire = isset($item[3]) ? $item[3] : null;
                 $expire = $expire ?? $this->defaultExpire * 60;
                 $key = $this->generateKey($gateway, $params);
-                $jsonData = json_encode($data);
-
-                //检查数据大小
-                $dataSize = strlen($jsonData);
-                if ($dataSize > $this->sizeLimit) {
-                    //数据过大，不缓存
+                $jsonData = $this->encodeStoredValue($data);
+                if ($jsonData === false) {
                     $results[$index] = false;
                     continue;
-                }
-
-                //加密数据
-                if ($this->encryptData && function_exists('encrypt')) {
-                    $jsonData = encrypt($jsonData);
-                    //再次检查加密后的数据大小
-                    if (strlen($jsonData) > $this->sizeLimit) {
-                        //加密后数据过大，不缓存
-                        $results[$index] = false;
-                        continue;
-                    }
                 }
 
                 //使用管道批量操作
@@ -610,33 +783,56 @@ class RequestCache
 
                     //保存标签关联
                     foreach ($this->tags as $tag) {
-                        $tagKey = "{$this->prefix}tags:{$tag}";
+                        $tagKey = $this->buildTagKey($tag);
                         $pipeline->sadd($tagKey, $key);
                         //为标签设置过期时间，防止内存泄漏
                         $pipeline->expire($tagKey, $expire + 3600);
                     }
+                    $localWrites[$index] = [$key, $data, $expire];
+                    $results[$index] = true;
+                    continue;
                 }
 
-                //将数据同步到本地缓存
-                $this->localCache->set($key, $data, $expire);
-                $results[$index] = true;
+                $results[$index] = $this->set($gateway, $params, $data, $expire);
             }
 
             //执行管道操作
             if ($pipeline) {
                 $pipeline->exec();
+                foreach ($localWrites as [$key, $data, $expire]) {
+                    $this->localCache->set($key, $data, $expire);
+                }
             }
         } catch (\Exception $e) {
-            //Redis 异常时，尝试使用本地缓存作为回退
+            if (!$this->isCrossSlotException($e)) {
+                //Redis 异常时，尝试使用本地缓存作为回退
+                foreach ($items as $index => $item) {
+                    if (array_key_exists($index, $results) && $results[$index] === false) {
+                        continue;
+                    }
+
+                    $gateway = $item[0];
+                    $params = $item[1];
+                    $data = $item[2];
+                    $expire = isset($item[3]) ? $item[3] : null;
+                    $expire = $expire ?? $this->defaultExpire * 60;
+                    $key = $this->generateKey($gateway, $params);
+
+                    if (!$this->allowsLocalFallbackWrite()) {
+                        $results[$index] = false;
+                        continue;
+                    }
+
+                    $this->localCache->set($key, $data, $expire);
+                    $results[$index] = true;
+                }
+                return $results;
+            }
+
+            //Redis Cluster 跨 slot 时降级为逐 key 写入
             foreach ($items as $index => $item) {
-                $gateway = $item[0];
-                $params = $item[1];
-                $data = $item[2];
                 $expire = isset($item[3]) ? $item[3] : null;
-                $expire = $expire ?? $this->defaultExpire * 60;
-                $key = $this->generateKey($gateway, $params);
-                $this->localCache->set($key, $data, $expire);
-                $results[$index] = true;
+                $results[$index] = $this->set($item[0], $item[1], $item[2], $expire);
             }
         }
 
@@ -651,13 +847,28 @@ class RequestCache
      */
     public function delete(string $gateway, array $params)
     {
+        $key = $this->generateKey($gateway, $params);
+        $this->localCache->delete($key);
+
         try {
-            $key = $this->generateKey($gateway, $params);
             //使用 Redis 连接池或直接使用 Redis 门面
             $redis = $this->redisPool ?: Redis::connection();
             return $redis->del($key) > 0;
         } catch (\Exception $e) {
             return false;
+        }
+    }
+
+    /**
+     * 获取 Laravel Redis key 前缀
+     * @return string
+     */
+    protected function redisPrefix(): string
+    {
+        try {
+            return config('database.redis.options.prefix', '');
+        } catch (\Exception $e) {
+            return '';
         }
     }
 
@@ -670,19 +881,30 @@ class RequestCache
      */
     protected function scanKeys(string $pattern, int $count = 1000, int $batchSize = 10000)
     {
-        $keys = [];
-        $cursor = '0';
-
-        // Get Redis prefix from config
-        try {
-            $redisPrefix = config('database.redis.options.prefix', '');
-        } catch (\Exception $e) {
-            $redisPrefix = '';
+        $connections = $this->clusterNodeResolver->scanConnections();
+        if (count($connections) === 1) {
+            return $this->scanKeysOnConnection(reset($connections), $pattern, $count, $batchSize);
         }
 
+        $result = $this->scanKeysOnConnections($connections, $pattern, $count, $batchSize);
+        return $result['keys'];
+    }
+
+    /**
+     * 使用指定连接执行 SCAN
+     * @param mixed $redis
+     * @param string $pattern
+     * @param int $count
+     * @param int $batchSize
+     * @return array
+     */
+    protected function scanKeysOnConnection($redis, string $pattern, int $count, int $batchSize): array
+    {
+        $keys = [];
+        $cursor = '0';
+        $redisPrefix = $this->redisPrefix();
+
         do {
-            //使用 Redis 连接池或直接使用 Redis 门面
-            $redis = $this->redisPool ?: Redis::connection();
             $fullPattern = $redisPrefix . $pattern;
             $result = $redis->scan($cursor, ['match' => $fullPattern, 'count' => $count]);
 
@@ -705,22 +927,48 @@ class RequestCache
     }
 
     /**
-     * 分批删除键
+     * 使用多个连接执行 SCAN
+     * @param array $connections
+     * @param string $pattern
+     * @param int $count
+     * @param int $batchSize
+     * @return array
+     */
+    protected function scanKeysOnConnections(array $connections, string $pattern, int $count, int $batchSize): array
+    {
+        $keys = [];
+        $keysByNode = [];
+        $failed = [];
+
+        foreach ($connections as $name => $redis) {
+            try {
+                $nodeKeys = $this->scanKeysOnConnection($redis, $pattern, $count, $batchSize);
+                $keysByNode[$name] = $nodeKeys;
+                $keys = array_merge($keys, $nodeKeys);
+            } catch (\Exception $e) {
+                $failed[$name] = $e->getMessage();
+            }
+        }
+
+        return [
+            'keys' => array_values(array_unique($keys)),
+            'keys_by_node' => $keysByNode,
+            'failed_nodes' => $failed,
+            'scanned_nodes' => count($connections) - count($failed),
+        ];
+    }
+
+    /**
+     * 使用指定连接分批删除键
+     * @param mixed $redis
      * @param array $keys
      * @param int $batchSize
      * @return int
      */
-    protected function batchDelete(array $keys, int $batchSize = 1000)
+    protected function batchDeleteOnConnection($redis, array $keys, int $batchSize = 1000): int
     {
         $deleted = 0;
-        $redis = $this->redisPool ?: Redis::connection();
-
-        // Get Redis prefix from config
-        try {
-            $redisPrefix = config('database.redis.options.prefix', '');
-        } catch (\Exception $e) {
-            $redisPrefix = '';
-        }
+        $redisPrefix = $this->redisPrefix();
 
         //分批删除
         foreach (array_chunk($keys, $batchSize) as $batch) {
@@ -730,15 +978,75 @@ class RequestCache
                     return preg_replace('/^' . preg_quote($redisPrefix, '/') . '/', '', $key);
                 }, $batch) : $batch;
 
-                $deleted += $redis->del($batchWithoutPrefix);
+                if ($this->isClusterSafeMode()) {
+                    foreach ($batchWithoutPrefix as $key) {
+                        $deleted += $redis->del($key);
+                    }
+                } else {
+                    $deleted += $redis->del($batchWithoutPrefix);
+                }
                 //每批删除后短暂休眠，减少 Redis 压力
                 usleep(10000); // 10ms
             } catch (\Exception $e) {
-                //忽略删除异常
+                if (!$this->isCrossSlotException($e)) {
+                    continue;
+                }
+
+                foreach ($batch as $key) {
+                    try {
+                        $keyWithoutPrefix = $redisPrefix
+                            ? preg_replace('/^' . preg_quote($redisPrefix, '/') . '/', '', $key)
+                            : $key;
+                        $deleted += $redis->del($keyWithoutPrefix);
+                    } catch (\Exception $ignored) {
+                        //忽略单 key 删除异常
+                    }
+                }
             }
         }
 
         return $deleted;
+    }
+
+    /**
+     * 分批删除键
+     * @param array $keys
+     * @param int $batchSize
+     * @return int
+     */
+    protected function batchDelete(array $keys, int $batchSize = 1000)
+    {
+        $redis = $this->redisPool ?: Redis::connection();
+        return $this->batchDeleteOnConnection($redis, $keys, $batchSize);
+    }
+
+    /**
+     * 按 pattern 清理缓存
+     * @param string $pattern
+     * @return bool
+     */
+    protected function clearByPattern(string $pattern): bool
+    {
+        $connections = $this->clusterNodeResolver->scanConnections();
+        if (count($connections) === 1) {
+            $redis = reset($connections);
+            $keys = $this->scanKeysOnConnection($redis, $pattern, 1000, 10000);
+            $deleted = empty($keys) ? 0 : $this->batchDeleteOnConnection($redis, $keys);
+            $this->localCache->flush();
+            return empty($keys) || $deleted > 0;
+        }
+
+        $scan = $this->scanKeysOnConnections($connections, $pattern, 1000, 10000);
+        $deleted = 0;
+        foreach ($scan['keys_by_node'] as $nodeName => $keys) {
+            if (!isset($connections[$nodeName])) {
+                continue;
+            }
+            $deleted += $this->batchDeleteOnConnection($connections[$nodeName], $keys);
+        }
+
+        $this->localCache->flush();
+        return empty($scan['keys']) || $deleted > 0;
     }
 
     /**
@@ -757,13 +1065,7 @@ class RequestCache
                 //只清除当前版本的缓存
                 $pattern = $this->prefix . $this->version . ':' . $gateway . ':*';
             }
-            $keys = $this->scanKeys($pattern);
-            if (empty($keys)) {
-                return true;
-            }
-            //分批删除，减少 Redis 压力
-            $deleted = $this->batchDelete($keys);
-            return $deleted > 0;
+            return $this->clearByPattern($pattern);
         } catch (\Exception $e) {
             return false;
         }
@@ -784,7 +1086,7 @@ class RequestCache
             $redis = $this->redisPool ?: Redis::connection();
 
             foreach ($tags as $tag) {
-                $tagKey = "{$this->prefix}tags:{$tag}";
+                $tagKey = $this->buildTagKey($tag);
                 $tagKeys = $redis->smembers($tagKey);
                 $keys = array_merge($keys, $tagKeys);
                 //删除标签集合
@@ -792,10 +1094,16 @@ class RequestCache
             }
 
             if (empty($keys)) {
+                $this->localCache->flush();
                 return true;
             }
 
-            return $redis->del($keys) > 0;
+            $deleted = $this->batchDelete(array_unique($keys));
+            if ($deleted > 0) {
+                $this->localCache->flush();
+            }
+
+            return $deleted > 0;
         } catch (\Exception $e) {
             return false;
         }
@@ -816,16 +1124,7 @@ class RequestCache
                 //只清除当前版本的缓存
                 $pattern = $this->prefix . $this->version . ':*';
             }
-
-            $keys = $this->scanKeys($pattern);
-
-            if (empty($keys)) {
-                return true;
-            }
-
-            //分批删除，减少 Redis 压力
-            $deleted = $this->batchDelete($keys);
-            return $deleted > 0;
+            return $this->clearByPattern($pattern);
         } catch (\Exception $e) {
             return false;
         }
@@ -837,14 +1136,15 @@ class RequestCache
      */
     protected function recordStats(string $type)
     {
+        $statsConfig = CacheConfig::getStatsConfig();
         if (!$this->enableStats) {
             return;
         }
 
         try {
             $today = date('Y-m-d');
-            $globalKey = "{$this->prefix}stats:{$type}";
-            $dailyKey = "{$this->prefix}stats:{$type}:{$today}";
+            $globalKey = $this->buildStatsKey($type);
+            $dailyKey = $this->buildStatsKey($type, $today);
 
             // 使用 Redis 连接池或直接使用 Redis 门面
             $redis = $this->redisPool ?: Redis::connection();
@@ -854,8 +1154,8 @@ class RequestCache
             $redis->incr($dailyKey);
 
             //设置过期时间：全局统计 30 天，每日统计 90 天
-            $redis->expire($globalKey, 30 * 24 * 3600);
-            $redis->expire($dailyKey, 90 * 24 * 3600);
+            $redis->expire($globalKey, $statsConfig['globalExpire'] ?? 30 * 24 * 3600);
+            $redis->expire($dailyKey, $statsConfig['dailyExpire'] ?? 90 * 24 * 3600);
         } catch (\Exception $e) {
             //忽略统计异常
         }
@@ -871,7 +1171,7 @@ class RequestCache
      */
     protected function acquireLock(string $key, int $expire = 10, int $retryTimes = 5, int $retryDelay = 100000)
     {
-        $lockKey = "{$this->prefix}lock:{$key}";
+        $lockKey = $this->buildLockKey($key);
         $lockValue = Str::random(32); //随机值，防止误释放
 
         try {
@@ -904,7 +1204,7 @@ class RequestCache
      */
     protected function renewLock(string $key, string $lockValue, int $expire = 10)
     {
-        $lockKey = "{$this->prefix}lock:{$key}";
+        $lockKey = $this->buildLockKey($key);
 
         try {
             //使用 Lua 脚本确保原子操作
@@ -935,7 +1235,7 @@ class RequestCache
      */
     protected function releaseLock(string $key, string $lockValue)
     {
-        $lockKey = "{$this->prefix}lock:{$key}";
+        $lockKey = $this->buildLockKey($key);
 
         try {
             //使用 Lua 脚本确保原子操作
@@ -1021,10 +1321,10 @@ class RequestCache
             $redis = $this->redisPool ?: Redis::connection();
 
             $stats = [
-                'hits' => (int) $redis->get("{$this->prefix}stats:hits") ?? 0,
-                'misses' => (int) $redis->get("{$this->prefix}stats:misses") ?? 0,
-                'today_hits' => (int) $redis->get("{$this->prefix}stats:hits:{$today}") ?? 0,
-                'today_misses' => (int) $redis->get("{$this->prefix}stats:misses:{$today}") ?? 0,
+                'hits' => (int) $redis->get($this->buildStatsKey('hits')) ?? 0,
+                'misses' => (int) $redis->get($this->buildStatsKey('misses')) ?? 0,
+                'today_hits' => (int) $redis->get($this->buildStatsKey('hits', $today)) ?? 0,
+                'today_misses' => (int) $redis->get($this->buildStatsKey('misses', $today)) ?? 0,
             ];
 
             $stats['hit_rate'] = $stats['hits'] + $stats['misses'] > 0

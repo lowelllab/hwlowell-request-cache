@@ -6,6 +6,9 @@ use Illuminate\Support\Facades\Config;
 
 class CacheConfig
 {
+    public const SCAN_STRATEGY_SINGLE_CONNECTION = 'single_connection';
+    public const SCAN_STRATEGY_ALL_NODES = 'all_nodes';
+
     /**
      * 缓存策略
      */
@@ -13,6 +16,7 @@ class CacheConfig
         'primary' => 'redis', //主缓存
         'secondary' => 'array', //备用缓存
         'fallback' => true, //启用降级
+        'shared_mode' => false, //共享模式：Redis 写失败时禁止本地写入兜底
     ];
     
     /**
@@ -56,6 +60,16 @@ class CacheConfig
         'idle_timeout' => 30, //空闲超时时间（秒）
         'health_check_interval' => 60, //健康检查间隔（秒）
     ];
+
+    /**
+     * Redis Cluster 配置
+     */
+    public static $redisCluster = [
+        'enabled' => false, //启用 Redis Cluster 原生分片兼容模式
+        'hash_tag' => null, //为空时使用 app_env_cache 作为 hash tag
+        'cluster_safe_mode' => true, //多 key 操作使用逐 key 兜底
+        'scan_strategy' => self::SCAN_STRATEGY_SINGLE_CONNECTION, //当前阶段使用当前连接执行 SCAN
+    ];
     
     /**
      * RediSearch 配置
@@ -67,6 +81,25 @@ class CacheConfig
         'timeout_ms' => 500, // 搜索超时时间（毫秒）
     ];
     
+    /**
+     * 归一化 Redis Cluster 配置
+     * @param array $config
+     * @return array
+     */
+    protected static function normalizeRedisClusterConfig(array $config): array
+    {
+        $allowed = [
+            self::SCAN_STRATEGY_SINGLE_CONNECTION,
+            self::SCAN_STRATEGY_ALL_NODES,
+        ];
+        $strategy = $config['scan_strategy'] ?? self::SCAN_STRATEGY_SINGLE_CONNECTION;
+        $config['scan_strategy'] = in_array($strategy, $allowed, true)
+            ? $strategy
+            : self::SCAN_STRATEGY_SINGLE_CONNECTION;
+
+        return $config;
+    }
+
     /**
      * 从配置文件加载配置
      * @param array $config
@@ -85,20 +118,47 @@ class CacheConfig
             }
             
             if (isset($cacheConfig['lock'])) {
-                self::$lock = array_merge(self::$lock, $cacheConfig['lock']);
+                $lockConfig = $cacheConfig['lock'];
+                if (isset($lockConfig['retry_times'])) {
+                    $lockConfig['retryTimes'] = $lockConfig['retry_times'];
+                }
+                if (isset($lockConfig['retry_delay'])) {
+                    $lockConfig['retryDelay'] = $lockConfig['retry_delay'];
+                }
+                if (isset($lockConfig['enable_extend'])) {
+                    $lockConfig['enableExtend'] = $lockConfig['enable_extend'];
+                }
+                if (isset($lockConfig['extend_interval'])) {
+                    $lockConfig['extendInterval'] = $lockConfig['extend_interval'];
+                }
+                self::$lock = array_merge(self::$lock, $lockConfig);
             }
             
             if (isset($cacheConfig['stats'])) {
-                self::$stats = array_merge(self::$stats, $cacheConfig['stats']);
+                $statsConfig = $cacheConfig['stats'];
+                if (isset($statsConfig['global_expire'])) {
+                    $statsConfig['globalExpire'] = $statsConfig['global_expire'];
+                }
+                if (isset($statsConfig['daily_expire'])) {
+                    $statsConfig['dailyExpire'] = $statsConfig['daily_expire'];
+                }
+                self::$stats = array_merge(self::$stats, $statsConfig);
             }
             
             if (isset($cacheConfig['redis_pool'])) {
                 self::$redisPool = array_merge(self::$redisPool, $cacheConfig['redis_pool']);
             }
-            
-            if (isset($cacheConfig['redis_search'])) {
-                self::$redisSearch = array_merge(self::$redisSearch, $cacheConfig['redis_search']);
+
+            if (isset($cacheConfig['redis_cluster'])) {
+                self::$redisCluster = self::normalizeRedisClusterConfig(array_merge(
+                    self::$redisCluster,
+                    $cacheConfig['redis_cluster']
+                ));
             }
+        }
+
+        if (isset($config['redis_search'])) {
+            self::$redisSearch = array_merge(self::$redisSearch, $config['redis_search']);
         }
     }
     
@@ -190,6 +250,24 @@ class CacheConfig
     public static function setRedisPoolConfig(array $config)
     {
         self::$redisPool = array_merge(self::$redisPool, $config);
+    }
+
+    /**
+     * 获取 Redis Cluster 配置
+     * @return array
+     */
+    public static function getRedisClusterConfig()
+    {
+        return self::$redisCluster;
+    }
+
+    /**
+     * 设置 Redis Cluster 配置
+     * @param array $config
+     */
+    public static function setRedisClusterConfig(array $config)
+    {
+        self::$redisCluster = self::normalizeRedisClusterConfig(array_merge(self::$redisCluster, $config));
     }
     
     /**

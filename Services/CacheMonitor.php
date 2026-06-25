@@ -14,15 +14,64 @@ class CacheMonitor
      * 缓存前缀
      */
     protected $prefix;
+
+    /**
+     * Redis Cluster 节点解析器
+     */
+    protected $clusterNodeResolver;
     
     /**
      * 构造函数
+     * @param array|null $config
      */
-    public function __construct()
+    public function __construct(array $config = null)
     {
-        $appName = env('APP_NAME', 'laravel');
-        $appEnv = env('APP_ENV', 'local');
-        $this->prefix = strtolower(str_replace(' ', '_', $appName)) . '_' . $appEnv . '_cache:';
+        $config = $config ?? $this->loadConfig();
+        RequestCache::loadConfig($config);
+        $this->prefix = RequestCache::resolvePrefix($config);
+        $this->clusterNodeResolver = new RedisClusterNodeResolver(CacheConfig::getRedisClusterConfig());
+    }
+
+    /**
+     * 加载缓存配置
+     * @return array
+     */
+    protected function loadConfig()
+    {
+        try {
+            return config('request_cache', []);
+        } catch (\Exception $e) {
+            $configPath = __DIR__ . '/../config/request_cache.php';
+            return file_exists($configPath) ? require $configPath : [];
+        }
+    }
+
+    /**
+     * 构建统计 key
+     * @param string $type
+     * @param string|null $date
+     * @return string
+     */
+    protected function buildStatsKey(string $type, string $date = null)
+    {
+        return $date === null
+            ? "{$this->prefix}stats:{$type}"
+            : "{$this->prefix}stats:{$type}:{$date}";
+    }
+
+    /**
+     * 返回扫描或监控作用域
+     * @param array $failedNodes
+     * @return string
+     */
+    protected function scanScope(array $failedNodes = []): string
+    {
+        if (!$this->clusterNodeResolver->isAllNodesStrategy()
+            || $this->clusterNodeResolver->usesCurrentConnectionFallback()) {
+            return 'current_connection';
+        }
+
+        return empty($failedNodes) ? 'cluster_aggregate' : 'cluster_partial';
     }
 
     /**
@@ -34,10 +83,10 @@ class CacheMonitor
         try {
             $today = date('Y-m-d');
             $stats = [
-                'hits' => (int) Redis::get('cache:stats:hits') ?? 0,
-                'misses' => (int) Redis::get('cache:stats:misses') ?? 0,
-                'today_hits' => (int) Redis::get('cache:stats:hits:' . $today) ?? 0,
-                'today_misses' => (int) Redis::get('cache:stats:misses:' . $today) ?? 0,
+                'hits' => (int) Redis::get($this->buildStatsKey('hits')) ?? 0,
+                'misses' => (int) Redis::get($this->buildStatsKey('misses')) ?? 0,
+                'today_hits' => (int) Redis::get($this->buildStatsKey('hits', $today)) ?? 0,
+                'today_misses' => (int) Redis::get($this->buildStatsKey('misses', $today)) ?? 0,
                 'cache_keys' => $this->getCacheKeyCount(),
                 'memory_usage' => $this->getMemoryUsage(),
                 'health_status' => $this->getHealthStatus(),
@@ -85,20 +134,48 @@ class CacheMonitor
     public function getMemoryUsage()
     {
         try {
-            $info = Redis::info('memory');
+            if (!$this->clusterNodeResolver->isAllNodesStrategy()) {
+                $info = Redis::info('memory');
+                return array_merge(['scope' => 'current_connection'], $this->normalizeMemoryInfo($info));
+            }
+
+            $connections = $this->clusterNodeResolver->scanConnections();
+            $nodes = [];
+            $failed = [];
+            $total = 0;
+            $maxmemory = 0;
+
+            foreach ($connections as $name => $redis) {
+                try {
+                    $info = $redis->info('memory');
+                    $nodes[$name] = $this->normalizeMemoryInfo($info);
+                    $total += (int) ($info['used_memory'] ?? 0);
+                    $maxmemory += (int) ($info['maxmemory'] ?? 0);
+                } catch (\Exception $e) {
+                    $failed[$name] = $e->getMessage();
+                }
+            }
+
+            if (empty($nodes)) {
+                return [
+                    'scope' => 'current_connection',
+                    'used_memory' => 0,
+                    'total_used_memory' => 0,
+                    'maxmemory' => 0,
+                    'total_maxmemory' => 0,
+                    'nodes' => [],
+                    'failed_nodes' => $failed,
+                ];
+            }
+
             return [
-                'used_memory' => $info['used_memory'] ?? 0,
-                'used_memory_human' => $info['used_memory_human'] ?? '0B',
-                'used_memory_rss' => $info['used_memory_rss'] ?? 0,
-                'used_memory_rss_human' => $info['used_memory_rss_human'] ?? '0B',
-                'used_memory_peak' => $info['used_memory_peak'] ?? 0,
-                'used_memory_peak_human' => $info['used_memory_peak_human'] ?? '0B',
-                'used_memory_lua' => $info['used_memory_lua'] ?? 0,
-                'used_memory_lua_human' => $info['used_memory_lua_human'] ?? '0B',
-                'maxmemory' => $info['maxmemory'] ?? 0,
-                'maxmemory_human' => $info['maxmemory_human'] ?? '0B',
-                'maxmemory_policy' => $info['maxmemory_policy'] ?? 'noeviction',
-                'mem_fragmentation_ratio' => $info['mem_fragmentation_ratio'] ?? 0,
+                'scope' => $this->scanScope($failed),
+                'used_memory' => $total,
+                'total_used_memory' => $total,
+                'maxmemory' => $maxmemory,
+                'total_maxmemory' => $maxmemory,
+                'nodes' => $nodes,
+                'failed_nodes' => $failed,
             ];
         } catch (\Exception $e) {
             return [
@@ -108,16 +185,68 @@ class CacheMonitor
     }
 
     /**
+     * 标准化 Redis memory 信息
+     * @param array $info
+     * @return array
+     */
+    protected function normalizeMemoryInfo(array $info): array
+    {
+        return [
+            'used_memory' => $info['used_memory'] ?? 0,
+            'used_memory_human' => $info['used_memory_human'] ?? '0B',
+            'used_memory_rss' => $info['used_memory_rss'] ?? 0,
+            'used_memory_rss_human' => $info['used_memory_rss_human'] ?? '0B',
+            'used_memory_peak' => $info['used_memory_peak'] ?? 0,
+            'used_memory_peak_human' => $info['used_memory_peak_human'] ?? '0B',
+            'used_memory_lua' => $info['used_memory_lua'] ?? 0,
+            'used_memory_lua_human' => $info['used_memory_lua_human'] ?? '0B',
+            'maxmemory' => $info['maxmemory'] ?? 0,
+            'maxmemory_human' => $info['maxmemory_human'] ?? '0B',
+            'maxmemory_policy' => $info['maxmemory_policy'] ?? 'noeviction',
+            'mem_fragmentation_ratio' => $info['mem_fragmentation_ratio'] ?? 0,
+        ];
+    }
+
+    /**
      * 获取缓存健康状态
      * @return string
      */
     public function getHealthStatus()
     {
         try {
+            if ($this->clusterNodeResolver->isAllNodesStrategy()) {
+                $connections = $this->clusterNodeResolver->scanConnections();
+                $healthyNodes = 0;
+                $failedNodes = 0;
+
+                foreach ($connections as $redis) {
+                    try {
+                        $pong = $redis->ping();
+                        if ($pong === 'PONG' || $pong === true || $pong === '+PONG') {
+                            $healthyNodes++;
+                        } else {
+                            $failedNodes++;
+                        }
+                    } catch (\Exception $e) {
+                        $failedNodes++;
+                    }
+                }
+
+                if ($healthyNodes === 0) {
+                    return 'unavailable';
+                }
+
+                if ($failedNodes > 0) {
+                    return 'warning';
+                }
+            }
+
             //检查 Redis 连接
-            $pong = Redis::ping();
-            if ($pong !== 'PONG') {
-                return 'unavailable';
+            if (!$this->clusterNodeResolver->isAllNodesStrategy()) {
+                $pong = Redis::ping();
+                if ($pong !== 'PONG') {
+                    return 'unavailable';
+                }
             }
 
             //检查内存使用情况
@@ -155,8 +284,8 @@ class CacheMonitor
 
             for ($i = $days - 1; $i >= 0; $i--) {
                 $date = date('Y-m-d', strtotime("-{$i} days"));
-                $hits = (int) Redis::get('cache:stats:hits:' . $date) ?? 0;
-                $misses = (int) Redis::get('cache:stats:misses:' . $date) ?? 0;
+                $hits = (int) Redis::get($this->buildStatsKey('hits', $date)) ?? 0;
+                $misses = (int) Redis::get($this->buildStatsKey('misses', $date)) ?? 0;
 
                 $trend[] = [
                     'date' => $date,
@@ -179,33 +308,58 @@ class CacheMonitor
     public function getKeyDistribution()
     {
         try {
-            $pattern = $this->prefix . '*';
-            $keys = $this->scanKeys($pattern);
+            $scan = $this->scanKeys($this->prefix . '*', 1000, true);
+            $keys = $scan['keys'];
 
             $distribution = [];
             foreach ($keys as $key) {
-                //提取版本和网关信息
-                $parts = explode(':', $key);
-                if (count($parts) >= 3) {
-                    $version = $parts[1];
-                    $gateway = $parts[2];
-
-                    if (!isset($distribution[$version])) {
-                        $distribution[$version] = [];
-                    }
-
-                    if (!isset($distribution[$version][$gateway])) {
-                        $distribution[$version][$gateway] = 0;
-                    }
-
-                    $distribution[$version][$gateway]++;
+                [$version, $gateway] = $this->parseCacheKeyParts($key);
+                if ($version === null || $gateway === null) {
+                    continue;
                 }
+
+                if (!isset($distribution[$version])) {
+                    $distribution[$version] = [];
+                }
+
+                if (!isset($distribution[$version][$gateway])) {
+                    $distribution[$version][$gateway] = 0;
+                }
+
+                $distribution[$version][$gateway]++;
             }
 
-            return $distribution;
+            if (!$this->clusterNodeResolver->isAllNodesStrategy()) {
+                return $distribution;
+            }
+
+            return [
+                'scope' => $scan['scope'],
+                'distribution' => $distribution,
+                'nodes' => $scan['nodes'],
+                'failed_nodes' => $scan['failed_nodes'],
+            ];
         } catch (\Exception $e) {
             return [];
         }
+    }
+
+    /**
+     * 解析缓存 key 中的版本和 gateway
+     * @param string $key
+     * @return array
+     */
+    protected function parseCacheKeyParts(string $key): array
+    {
+        $redisPrefix = $this->redisPrefix();
+        if ($redisPrefix !== '') {
+            $key = preg_replace('/^' . preg_quote($redisPrefix, '/') . '/', '', $key);
+        }
+
+        $key = preg_replace('/^' . preg_quote($this->prefix, '/') . '/', '', $key);
+        $parts = explode(':', $key);
+
+        return count($parts) >= 2 ? [$parts[0], $parts[1]] : [null, null];
     }
 
     /**
@@ -239,17 +393,69 @@ class CacheMonitor
      * @param int $count
      * @return array
      */
-    protected function scanKeys(string $pattern, int $count = 1000)
+    protected function redisPrefix(): string
+    {
+        try {
+            return config('database.redis.options.prefix', '');
+        } catch (\Exception $e) {
+            return '';
+        }
+    }
+
+    /**
+     * 使用 SCAN 命令获取匹配的键
+     * @param string $pattern
+     * @param int $count
+     * @param bool $withMeta
+     * @return array
+     */
+    protected function scanKeys(string $pattern, int $count = 1000, bool $withMeta = false)
     {
         $keys = [];
-        $cursor = '0';
+        $nodes = [];
+        $failed = [];
+        $redisPrefix = $this->redisPrefix();
+        $connections = $this->clusterNodeResolver->scanConnections();
 
-        do {
-            $result = Redis::command('SCAN', [$cursor, 'MATCH', $pattern, 'COUNT', $count]);
-            $cursor = $result[0];
-            $keys = array_merge($keys, $result[1]);
-        } while ($cursor != '0');
+        foreach ($connections as $name => $redis) {
+            $cursor = '0';
+            $iterations = 0;
+            $nodeKeys = [];
 
-        return $keys;
+            try {
+                do {
+                    $result = $redis->scan($cursor, ['match' => $redisPrefix . $pattern, 'count' => $count]);
+                    if ($result === false) {
+                        break;
+                    }
+
+                    $cursor = $result[0];
+                    $batch = $result[1];
+                    $nodeKeys = array_merge($nodeKeys, $batch);
+                    $iterations++;
+                } while ($cursor != '0');
+
+                $keys = array_merge($keys, $nodeKeys);
+                $nodes[$name] = [
+                    'matched_keys' => count($nodeKeys),
+                    'scan_iterations' => $iterations,
+                ];
+            } catch (\Exception $e) {
+                $failed[$name] = $e->getMessage();
+            }
+        }
+
+        $keys = array_values(array_unique($keys));
+
+        if (!$withMeta) {
+            return $keys;
+        }
+
+        return [
+            'keys' => $keys,
+            'scope' => $this->scanScope($failed),
+            'nodes' => $nodes,
+            'failed_nodes' => $failed,
+        ];
     }
 }

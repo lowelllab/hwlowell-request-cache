@@ -13,12 +13,17 @@ class RequestCacheServiceProvider extends ServiceProvider
      */
     public function register()
     {
+        $this->mergeConfigFrom(__DIR__ . '/../config/request_cache.php', 'request_cache');
+
         $this->app->singleton('request-cache', function ($app) {
-            return new RequestCache(config('request_cache', []));
+            $config = config('request_cache', []);
+            RequestCache::loadConfig($config);
+
+            return new RequestCache($config);
         });
 
         $this->app->singleton('cache-monitor', function ($app) {
-            return new CacheMonitor();
+            return new CacheMonitor(config('request_cache', []));
         });
     }
 
@@ -31,7 +36,7 @@ class RequestCacheServiceProvider extends ServiceProvider
     {
         //Publish configuration if needed
         $this->publishes([
-            __DIR__ . '/../config/request_cache.php' => config_path('request-cache.php'),
+            __DIR__ . '/../config/request_cache.php' => config_path('request_cache.php'),
         ], 'config');
     }
 
