@@ -11,7 +11,6 @@ RequestCache 是一个面向 Laravel 应用的请求级缓存包，支持 Redis 
 - 支持分布式锁，降低缓存击穿风险。
 - 支持缓存预热。
 - 支持对敏感缓存数据进行 Laravel 加密。
-- 支持 Redis 连接池管理。
 - 支持 `mget`、`mset` 等批量操作。
 - 支持缓存版本控制。
 - 支持 Redis Cluster hash tag key 前缀，降低跨 slot 风险。
@@ -79,7 +78,9 @@ return [
 - `cluster_safe_mode`：是否启用集群安全模式。启用后，涉及多个 key 的操作会降级为逐 key 操作，例如 `mget`、`mset`、标签清理和批量删除，从而避免 Redis Cluster 不允许跨 slot 多 key 命令的问题。
 - `scan_strategy`：控制基于 SCAN 的清理和监控范围。默认 `single_connection` 只处理当前 Redis 连接；设置为 `all_nodes` 时，会读取宿主 Laravel 项目的 `database.redis.clusters` 节点配置，并尝试遍历所有集群节点。
 
-`redis_cluster` 只控制本包的 Redis Cluster 兼容行为，不负责定义 Redis Cluster 节点。Redis 连接和节点列表仍应配置在 Laravel 项目的 `config/database.php` 中。
+`redis_cluster` 只控制本包的 Redis Cluster 兼容行为，不负责定义 Redis Cluster 节点。Redis 连接、节点列表和底层连接复用仍应配置在 Laravel 项目的 `config/database.php` 中，并由 Laravel Redis Manager 统一管理。
+
+本包不提供独立 Redis 连接池；缓存读写、标签、统计、锁和扫描回退都会通过 Laravel Redis Manager 获取 Redis 连接。
 
 `scan_strategy` 用于控制基于 SCAN 的清理与监控范围：
 
@@ -492,15 +493,14 @@ $cache->clearTags('product');
 
 1. 根据数据更新频率合理设置缓存过期时间，避免过期过于频繁或数据过旧。
 2. 多个缓存操作优先使用 `mget` 和 `mset`，减少网络请求次数。
-3. 高并发场景可启用 Redis 连接池。
-4. 为相关缓存添加标签，便于批量清理。
-5. 在系统启动或低峰期预热热点数据。
-6. 定期观察缓存命中率，持续优化缓存策略。
-7. 对不存在的数据也进行适当短期缓存，降低缓存穿透风险。
-8. 根据服务器内存设置合适的本地缓存大小。
-9. Redis Cluster 部署中启用 `redis_cluster.enabled` 和 `cluster_safe_mode`。
-10. Redis Cluster 需要全节点清理或聚合监控时启用 `scan_strategy=all_nodes`。
-11. 多实例严格共享部署中启用 `shared_mode`，避免 Redis 写失败后出现本地伪成功。
+3. 为相关缓存添加标签，便于批量清理。
+4. 在系统启动或低峰期预热热点数据。
+5. 定期观察缓存命中率，持续优化缓存策略。
+6. 对不存在的数据也进行适当短期缓存，降低缓存穿透风险。
+7. 根据服务器内存设置合适的本地缓存大小。
+8. Redis Cluster 部署中启用 `redis_cluster.enabled` 和 `cluster_safe_mode`。
+9. Redis Cluster 需要全节点清理或聚合监控时启用 `scan_strategy=all_nodes`。
+10. 多实例严格共享部署中启用 `shared_mode`，避免 Redis 写失败后出现本地伪成功。
 
 ## 注意事项
 
@@ -508,10 +508,9 @@ $cache->clearTags('product');
 2. **数据大小限制：** 默认单条缓存大小限制为 1MB，超过限制的数据不会写入缓存。
 3. **参数过滤：** 默认会过滤缓存参数，移除潜在安全风险。
 4. **加密依赖：** 数据加密依赖 Laravel 的 `encrypt` 和 `decrypt` 函数；非 Laravel 环境下会自动跳过。
-5. **连接池配置：** 请根据服务器性能和并发量调整 Redis 连接池配置。
-6. **错误处理：** 默认策略允许 Redis 不可用时使用当前进程本地缓存兜底；启用 `shared_mode` 后，Redis 写失败会返回失败，不会写入本地缓存并伪装成功。
-7. **版本控制：** 可通过缓存版本号实现整体换版，减少缓存不一致问题。
-8. **Redis Cluster 全节点扫描：** `all_nodes` 依赖 Laravel 的 `database.redis.clusters` 配置；解析失败时会回退当前连接视角。
+5. **错误处理：** 默认策略允许 Redis 不可用时使用当前进程本地缓存兜底；启用 `shared_mode` 后，Redis 写失败会返回失败，不会写入本地缓存并伪装成功。
+6. **版本控制：** 可通过缓存版本号实现整体换版，减少缓存不一致问题。
+7. **Redis Cluster 全节点扫描：** `all_nodes` 依赖 Laravel 的 `database.redis.clusters` 配置；解析失败时会回退当前连接视角。
 
 ## 配置选项
 

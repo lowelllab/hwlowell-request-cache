@@ -105,6 +105,8 @@ class RequestCacheClusterTest extends TestCase
         $this->assertArrayHasKey('redis_cluster', $config['cache']);
         $this->assertArrayHasKey('cluster_safe_mode', $config['cache']['redis_cluster']);
         $this->assertArrayHasKey('scan_strategy', $config['cache']['redis_cluster']);
+        $removedKey = 'redis' . '_pool';
+        $this->assertArrayNotHasKey($removedKey, $config['cache']);
     }
 
     public function testStrategyLoadsSharedMode()
@@ -145,13 +147,78 @@ class RequestCacheClusterTest extends TestCase
         $this->assertSame('single_connection', CacheConfig::getRedisClusterConfig()['scan_strategy']);
     }
 
+    public function testCacheConfigNoLongerExposesCustomPoolConfiguration()
+    {
+        $reflection = new ReflectionClass(CacheConfig::class);
+        $removedProperty = 'redis' . 'Pool';
+        $removedGetter = 'getRedis' . 'PoolConfig';
+        $removedSetter = 'setRedis' . 'PoolConfig';
+
+        $this->assertFalse($reflection->hasProperty($removedProperty));
+        $this->assertFalse($reflection->hasMethod($removedGetter));
+        $this->assertFalse($reflection->hasMethod($removedSetter));
+
+        CacheConfig::loadFromConfig([
+            'cache' => [
+                'redis' . '_pool' => [
+                    'enabled' => true,
+                ],
+            ],
+        ]);
+
+        $this->assertFalse($reflection->hasProperty($removedProperty));
+    }
+
+    public function testRuntimeNoLongerReferencesCustomPool()
+    {
+        $requestCache = file_get_contents(__DIR__ . '/../Services/RequestCache.php');
+        $resolver = file_get_contents(__DIR__ . '/../Services/RedisClusterNodeResolver.php');
+        $removedClass = 'Redis' . 'Connection' . 'Pool';
+        $removedProperty = 'redis' . 'Pool';
+        $removedBranch = '$this->' . $removedProperty . ' ?: Redis::connection()';
+        $removedGetter = 'getRedis' . 'PoolConfig';
+
+        $this->assertStringNotContainsString($removedClass, $requestCache);
+        $this->assertStringNotContainsString($removedProperty, $requestCache);
+        $this->assertStringNotContainsString($removedBranch, $requestCache);
+        $this->assertStringNotContainsString($removedGetter, $requestCache);
+        $this->assertStringNotContainsString('fallbackConnection', $resolver);
+        $this->assertStringNotContainsString('$fallbackConnection', $resolver);
+        $this->assertFileDoesNotExist(__DIR__ . '/../Services/' . $removedClass . '.php');
+    }
+
+    public function testRequestCacheUsesLaravelRedisConnectionForClusterReadsAndWrites()
+    {
+        $writeRedis = $this->redisFake([
+            'setex' => true,
+        ]);
+        $readRedis = $this->redisFake([
+            'get' => json_encode(['name' => 'Ada']),
+        ]);
+        Redis::shouldReceive('connection')->twice()->andReturn($writeRedis, $readRedis);
+
+        $writeCache = new RequestCache($this->clusterConfig([
+            'hash_tag' => 'request-cache',
+        ]));
+        $readCache = new RequestCache($this->clusterConfig([
+            'hash_tag' => 'request-cache',
+        ]));
+
+        $this->assertTrue($writeCache->set('users', ['id' => 1], ['name' => 'Ada'], 60));
+        $this->assertSame(['name' => 'Ada'], $readCache->get('users', ['id' => 1]));
+        $this->assertArrayHasKey('setex', $writeRedis->calls);
+        $this->assertArrayHasKey('get', $readRedis->calls);
+    }
+
     public function testRedisClusterNodeResolverUsesCurrentConnectionForSingleConnectionStrategy()
     {
         $fallback = $this->redisFake([]);
+        Redis::shouldReceive('connection')->once()->andReturn($fallback);
+
         $resolver = new RedisClusterNodeResolver([
             'enabled' => true,
             'scan_strategy' => 'single_connection',
-        ], $fallback);
+        ]);
 
         $this->assertSame(['current_connection' => $fallback], $resolver->scanConnections());
         $this->assertTrue($resolver->usesCurrentConnectionFallback());
@@ -161,10 +228,12 @@ class RequestCacheClusterTest extends TestCase
     {
         Config::set('database.redis.clusters', []);
         $fallback = $this->redisFake([]);
+        Redis::shouldReceive('connection')->once()->andReturn($fallback);
+
         $resolver = new RedisClusterNodeResolver([
             'enabled' => true,
             'scan_strategy' => 'all_nodes',
-        ], $fallback);
+        ]);
 
         $this->assertSame(['current_connection' => $fallback], $resolver->scanConnections());
         $this->assertTrue($resolver->usesCurrentConnectionFallback());
@@ -211,11 +280,12 @@ class RequestCacheClusterTest extends TestCase
             ->once()
             ->with('request_cache_cluster_node_default_0')
             ->andThrow(new RuntimeException('node unavailable'));
+        Redis::shouldReceive('connection')->once()->andReturn($fallback);
 
         $resolver = new RedisClusterNodeResolver([
             'enabled' => true,
             'scan_strategy' => 'all_nodes',
-        ], $fallback);
+        ]);
 
         $this->assertSame(['current_connection' => $fallback], $resolver->scanConnections());
         $this->assertTrue($resolver->usesCurrentConnectionFallback());
@@ -824,9 +894,9 @@ class RequestCacheClusterTest extends TestCase
         $this->assertStringContainsString('cluster_safe_mode', $readme);
         $this->assertStringContainsString('fallback', $readme);
         $this->assertStringContainsString('shared_mode', $readme);
-        $this->assertStringContainsString('single-key Redis commands', $readme);
+        $this->assertStringContainsString('逐 key Redis 命令', $readme);
         $this->assertStringContainsString('LocalCache', $readme);
-        $this->assertStringContainsString('will not write to `LocalCache`', $readme);
+        $this->assertStringContainsString('不会写入 `LocalCache`', $readme);
     }
 
     public function testReadmeSharedModeConfigurationExampleMatchesPackageConfigShape()
@@ -845,7 +915,7 @@ class RequestCacheClusterTest extends TestCase
         $readme = file_get_contents(__DIR__ . '/../README.md');
 
         $this->assertStringContainsString('shared_mode', $readme);
-        $this->assertStringContainsString('Redis 写失败会返回失败结果', $readme);
+        $this->assertStringContainsString('Redis 写失败会返回失败', $readme);
         $this->assertStringContainsString('不会写入本地缓存', $readme);
     }
 
@@ -856,6 +926,20 @@ class RequestCacheClusterTest extends TestCase
         $this->assertTrue(
             str_contains($readme, 'current_connection') || str_contains($readme, '当前连接视角')
         );
+    }
+
+    public function testReadmeNoLongerDocumentsCustomPoolFeature()
+    {
+        $readme = file_get_contents(__DIR__ . '/../README.md');
+        $removedKey = 'redis' . '_pool';
+
+        $this->assertStringNotContainsString($removedKey, $readme);
+        $this->assertStringNotContainsString('支持 Redis 连接池管理', $readme);
+        $this->assertStringNotContainsString('连接池管理', $readme);
+        $this->assertStringNotContainsString('高并发场景可启用 Redis 连接池', $readme);
+        $this->assertStringNotContainsString('连接池配置', $readme);
+        $this->assertStringContainsString('Laravel Redis Manager', $readme);
+        $this->assertStringContainsString('本包不提供独立 Redis 连接池', $readme);
     }
 
     public function testReadmeDocumentsAllNodesScanStrategyAndClusterScopes()
@@ -911,9 +995,6 @@ class RequestCacheClusterTest extends TestCase
                     'enabled' => false,
                     'global_expire' => 30 * 24 * 3600,
                     'daily_expire' => 90 * 24 * 3600,
-                ],
-                'redis_pool' => [
-                    'enabled' => false,
                 ],
                 'redis_cluster' => array_merge([
                     'enabled' => true,

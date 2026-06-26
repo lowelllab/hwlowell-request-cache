@@ -8,13 +8,11 @@ use Illuminate\Support\Facades\Redis;
 class RedisClusterNodeResolver
 {
     protected array $clusterConfig;
-    protected $fallbackConnection;
     protected bool $usingCurrentConnectionFallback = false;
 
-    public function __construct(array $clusterConfig = null, $fallbackConnection = null)
+    public function __construct(array $clusterConfig = null)
     {
         $this->clusterConfig = $clusterConfig ?? CacheConfig::getRedisClusterConfig();
-        $this->fallbackConnection = $fallbackConnection;
     }
 
     public function isAllNodesStrategy(): bool
@@ -46,7 +44,7 @@ class RedisClusterNodeResolver
 
     protected function currentConnection()
     {
-        return $this->fallbackConnection ?: Redis::connection();
+        return Redis::connection();
     }
 
     public function usesCurrentConnectionFallback(): bool

@@ -8,7 +8,6 @@ use Illuminate\Support\Str;
 use HwlowellRequestCache\FilterConfig;
 use HwlowellRequestCache\CacheConfig;
 use HwlowellRequestCache\LocalCache;
-use HwlowellRequestCache\RedisConnectionPool;
 
 class RequestCache
 {
@@ -73,11 +72,6 @@ class RequestCache
      * 缓存大小限制（字节）
      */
     protected $sizeLimit = 1048576; // 1MB
-
-    /**
-     * Redis 连接池实例
-     */
-    protected $redisPool;
 
     /**
      * Redis Cluster 节点解析器
@@ -247,16 +241,7 @@ class RequestCache
 
         $this->localCache = new LocalCache();
 
-        //初始化 Redis 连接池
-        $poolConfig = CacheConfig::getRedisPoolConfig();
-        if ($poolConfig['enabled']) {
-            $this->redisPool = RedisConnectionPool::getInstance($poolConfig);
-        }
-
-        $this->clusterNodeResolver = new RedisClusterNodeResolver(
-            CacheConfig::getRedisClusterConfig(),
-            $this->redisPool ?: null
-        );
+        $this->clusterNodeResolver = new RedisClusterNodeResolver(CacheConfig::getRedisClusterConfig());
     }
 
     /**
@@ -596,8 +581,8 @@ class RequestCache
         //尝试从主缓存（Redis）获取
         if ($strategy['primary'] === 'redis') {
             try {
-                //使用 Redis 连接池或直接使用 Redis 门面
-                $redis = $this->redisPool ?: Redis::connection();
+                //使用 Laravel Redis 连接
+                $redis = Redis::connection();
                 $value = $redis->get($key);
 
                 if ($value) {
@@ -646,8 +631,8 @@ class RequestCache
         // 如果有需要从 Redis 获取的键
         if (!empty($keysToGet) && $strategy['primary'] === 'redis') {
             try {
-                //使用 Redis 连接池或直接使用 Redis 门面
-                $redis = $this->redisPool ?: Redis::connection();
+                //使用 Laravel Redis 连接
+                $redis = Redis::connection();
                 $values = $this->isClusterSafeMode()
                     ? array_map(function ($key) use ($redis) {
                         return $redis->get($key);
@@ -675,7 +660,7 @@ class RequestCache
 
                 foreach ($keysToGet as $key) {
                     try {
-                        $redis = $this->redisPool ?: Redis::connection();
+                        $redis = Redis::connection();
                         $value = $redis->get($key);
                         if (!$value) {
                             continue;
@@ -714,8 +699,8 @@ class RequestCache
                 return false;
             }
 
-            // 使用 Redis 连接池或直接使用 Redis 门面
-            $redis = $this->redisPool ?: Redis::connection();
+            // 使用 Laravel Redis 连接
+            $redis = Redis::connection();
             $result = $redis->setex($key, $expire, $jsonData);
 
             //保存标签关联
@@ -759,8 +744,8 @@ class RequestCache
         try {
             //如果使用 Redis 作为主缓存，使用管道批量操作
             if ($strategy['primary'] === 'redis' && !$this->isClusterSafeMode()) {
-                //使用 Redis 连接池或直接使用 Redis 门面
-                $redis = $this->redisPool ?: Redis::connection();
+                //使用 Laravel Redis 连接
+                $redis = Redis::connection();
                 $pipeline = $redis->pipeline();
             }
 
@@ -851,8 +836,8 @@ class RequestCache
         $this->localCache->delete($key);
 
         try {
-            //使用 Redis 连接池或直接使用 Redis 门面
-            $redis = $this->redisPool ?: Redis::connection();
+            //使用 Laravel Redis 连接
+            $redis = Redis::connection();
             return $redis->del($key) > 0;
         } catch (\Exception $e) {
             return false;
@@ -1016,7 +1001,7 @@ class RequestCache
      */
     protected function batchDelete(array $keys, int $batchSize = 1000)
     {
-        $redis = $this->redisPool ?: Redis::connection();
+        $redis = Redis::connection();
         return $this->batchDeleteOnConnection($redis, $keys, $batchSize);
     }
 
@@ -1082,8 +1067,8 @@ class RequestCache
             $tags = is_array($tags) ? $tags : func_get_args();
             $keys = [];
 
-            //使用 Redis 连接池或直接使用 Redis 门面
-            $redis = $this->redisPool ?: Redis::connection();
+            //使用 Laravel Redis 连接
+            $redis = Redis::connection();
 
             foreach ($tags as $tag) {
                 $tagKey = $this->buildTagKey($tag);
@@ -1146,8 +1131,8 @@ class RequestCache
             $globalKey = $this->buildStatsKey($type);
             $dailyKey = $this->buildStatsKey($type, $today);
 
-            // 使用 Redis 连接池或直接使用 Redis 门面
-            $redis = $this->redisPool ?: Redis::connection();
+            // 使用 Laravel Redis 连接
+            $redis = Redis::connection();
 
             //增加统计计数
             $redis->incr($globalKey);
@@ -1175,8 +1160,8 @@ class RequestCache
         $lockValue = Str::random(32); //随机值，防止误释放
 
         try {
-            //使用 Redis 连接池或直接使用 Redis 门面
-            $redis = $this->redisPool ?: Redis::connection();
+            //使用 Laravel Redis 连接
+            $redis = Redis::connection();
 
             for ($i = 0; $i < $retryTimes; $i++) {
                 if ($redis->set($lockKey, $lockValue, 'EX', $expire, 'NX')) {
@@ -1216,8 +1201,8 @@ class RequestCache
                 end
             LUA;
 
-            //使用 Redis 连接池或直接使用 Redis 门面
-            $redis = $this->redisPool ?: Redis::connection();
+            //使用 Laravel Redis 连接
+            $redis = Redis::connection();
 
             //直接执行 eval 命令
             return $redis->eval($script, 1, $lockKey, $lockValue, $expire) > 0;
@@ -1247,8 +1232,8 @@ class RequestCache
                 end
             LUA;
 
-            //使用 Redis 连接池或直接使用 Redis 门面
-            $redis = $this->redisPool ?: Redis::connection();
+            //使用 Laravel Redis 连接
+            $redis = Redis::connection();
 
             //直接执行 eval 命令
             return $redis->eval($script, 1, $lockKey, $lockValue) > 0;
@@ -1317,8 +1302,8 @@ class RequestCache
     {
         try {
             $today = date('Y-m-d');
-            //使用 Redis 连接池或直接使用 Redis 门面
-            $redis = $this->redisPool ?: Redis::connection();
+            //使用 Laravel Redis 连接
+            $redis = Redis::connection();
 
             $stats = [
                 'hits' => (int) $redis->get($this->buildStatsKey('hits')) ?? 0,

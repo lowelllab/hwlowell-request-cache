@@ -93,18 +93,6 @@ return [
             'daily_expire' => 90 * 24 * 3600, //每日统计过期时间（秒）
         ],
 
-        //Redis 连接池配置
-        'redis_pool' => [
-            'enabled' => true, //禁用连接池（非Laravel环境）
-            'max_connections' => 10, //最大连接数
-            'min_connections' => 2, //最小连接数
-            'connection_timeout' => 5, //连接超时时间（秒）
-            'retry_attempts' => 3, //重试次数
-            'retry_delay' => 1000, //重试延迟（毫秒）
-            'idle_timeout' => 30, //空闲超时时间（秒）
-            'health_check_interval' => 60, //健康检查间隔（秒）
-        ],
-
         //Redis Cluster 原生分片兼容配置
         'redis_cluster' => [
             'enabled' => false, //启用后使用 Redis hash tag 规避 CROSSSLOT

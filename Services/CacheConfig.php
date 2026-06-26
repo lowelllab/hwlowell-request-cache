@@ -48,20 +48,6 @@ class CacheConfig
     ];
     
     /**
-     * Redis 连接池配置
-     */
-    public static $redisPool = [
-        'enabled' => true, //启用连接池
-        'max_connections' => 10, //最大连接数
-        'min_connections' => 2, //最小连接数
-        'connection_timeout' => 5, //连接超时时间（秒）
-        'retry_attempts' => 3, //重试次数
-        'retry_delay' => 1000, //重试延迟（毫秒）
-        'idle_timeout' => 30, //空闲超时时间（秒）
-        'health_check_interval' => 60, //健康检查间隔（秒）
-    ];
-
-    /**
      * Redis Cluster 配置
      */
     public static $redisCluster = [
@@ -145,10 +131,6 @@ class CacheConfig
                 self::$stats = array_merge(self::$stats, $statsConfig);
             }
             
-            if (isset($cacheConfig['redis_pool'])) {
-                self::$redisPool = array_merge(self::$redisPool, $cacheConfig['redis_pool']);
-            }
-
             if (isset($cacheConfig['redis_cluster'])) {
                 self::$redisCluster = self::normalizeRedisClusterConfig(array_merge(
                     self::$redisCluster,
@@ -234,24 +216,6 @@ class CacheConfig
         self::$stats = array_merge(self::$stats, $config);
     }
     
-    /**
-     * 获取 Redis 连接池配置
-     * @return array
-     */
-    public static function getRedisPoolConfig()
-    {
-        return self::$redisPool;
-    }
-    
-    /**
-     * 设置 Redis 连接池配置
-     * @param array $config
-     */
-    public static function setRedisPoolConfig(array $config)
-    {
-        self::$redisPool = array_merge(self::$redisPool, $config);
-    }
-
     /**
      * 获取 Redis Cluster 配置
      * @return array
