@@ -47,6 +47,25 @@ class CacheMonitor
     }
 
     /**
+     * 获取配置中的默认 Redis 连接名
+     */
+    protected function defaultConnectionName(): string
+    {
+        $name = CacheConfig::getRedisClusterConfig()['default_connection'] ?? CacheConfig::DEFAULT_CONNECTION;
+
+        return is_string($name) && $name !== '' ? $name : CacheConfig::DEFAULT_CONNECTION;
+    }
+
+    /**
+     * 获取默认 Redis 连接
+     * @return mixed
+     */
+    protected function connection()
+    {
+        return Redis::connection($this->defaultConnectionName());
+    }
+
+    /**
      * 构建统计 key
      * @param string $type
      * @param string|null $date
@@ -82,11 +101,12 @@ class CacheMonitor
     {
         try {
             $today = date('Y-m-d');
+            $redis = $this->connection();
             $stats = [
-                'hits' => (int) Redis::get($this->buildStatsKey('hits')) ?? 0,
-                'misses' => (int) Redis::get($this->buildStatsKey('misses')) ?? 0,
-                'today_hits' => (int) Redis::get($this->buildStatsKey('hits', $today)) ?? 0,
-                'today_misses' => (int) Redis::get($this->buildStatsKey('misses', $today)) ?? 0,
+                'hits' => (int) $redis->get($this->buildStatsKey('hits')) ?? 0,
+                'misses' => (int) $redis->get($this->buildStatsKey('misses')) ?? 0,
+                'today_hits' => (int) $redis->get($this->buildStatsKey('hits', $today)) ?? 0,
+                'today_misses' => (int) $redis->get($this->buildStatsKey('misses', $today)) ?? 0,
                 'cache_keys' => $this->getCacheKeyCount(),
                 'memory_usage' => $this->getMemoryUsage(),
                 'health_status' => $this->getHealthStatus(),
@@ -135,7 +155,7 @@ class CacheMonitor
     {
         try {
             if (!$this->clusterNodeResolver->isAllNodesStrategy()) {
-                $info = Redis::info('memory');
+                $info = $this->connection()->info('memory');
                 return array_merge(['scope' => 'current_connection'], $this->normalizeMemoryInfo($info));
             }
 
@@ -243,7 +263,7 @@ class CacheMonitor
 
             //检查 Redis 连接
             if (!$this->clusterNodeResolver->isAllNodesStrategy()) {
-                $pong = Redis::ping();
+                $pong = $this->connection()->ping();
                 if ($pong !== 'PONG') {
                     return 'unavailable';
                 }
@@ -281,11 +301,12 @@ class CacheMonitor
     {
         try {
             $trend = [];
+            $redis = $this->connection();
 
             for ($i = $days - 1; $i >= 0; $i--) {
                 $date = date('Y-m-d', strtotime("-{$i} days"));
-                $hits = (int) Redis::get($this->buildStatsKey('hits', $date)) ?? 0;
-                $misses = (int) Redis::get($this->buildStatsKey('misses', $date)) ?? 0;
+                $hits = (int) $redis->get($this->buildStatsKey('hits', $date)) ?? 0;
+                $misses = (int) $redis->get($this->buildStatsKey('misses', $date)) ?? 0;
 
                 $trend[] = [
                     'date' => $date,
@@ -381,7 +402,7 @@ class CacheMonitor
     public function getRedisInfo(string $section = 'all')
     {
         try {
-            return Redis::info($section);
+            return $this->connection()->info($section);
         } catch (\Exception $e) {
             return ['error' => $e->getMessage()];
         }

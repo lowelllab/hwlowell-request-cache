@@ -79,6 +79,11 @@ class RequestCache
     protected $clusterNodeResolver;
 
     /**
+     * 当前绑定的 Laravel Redis 连接名，null 表示未绑定（使用 default_connection）
+     */
+    protected ?string $connectionName = null;
+
+    /**
      * 加载配置文件
      * @return array|null
      */
@@ -312,6 +317,136 @@ class RequestCache
     {
         $this->sizeLimit = $sizeLimit;
         return $this;
+    }
+
+    /**
+     * 绑定目标 Redis 集群，返回携带绑定的克隆实例
+     * @param string $name Laravel Redis 连接名
+     * @return static
+     */
+    public function cluster(string $name): static
+    {
+        $this->assertClusterSwitchingEnabled();
+        $this->assertConnectionAllowed($name);
+
+        //返回克隆实例而非 $this：request-cache 注册为容器单例，写在 $this 上会让绑定跨调用粘连
+        $clone = clone $this;
+        $clone->connectionName = $name;
+        $clone->clusterNodeResolver = new RedisClusterNodeResolver(CacheConfig::getRedisClusterConfig(), $name);
+
+        return $clone;
+    }
+
+    /**
+     * 获取当前有效 Redis 连接名
+     * @return string
+     */
+    protected function effectiveConnectionName(): string
+    {
+        return $this->connectionName ?? $this->defaultConnectionName();
+    }
+
+    /**
+     * 获取当前有效 Redis 连接
+     * @return mixed
+     */
+    protected function connection()
+    {
+        return Redis::connection($this->effectiveConnectionName());
+    }
+
+    /**
+     * 获取默认连接：统计计数固定读写该连接，与锁跟随目标集群的语义故意不同
+     * @return mixed
+     */
+    protected function defaultConnection()
+    {
+        return Redis::connection($this->defaultConnectionName());
+    }
+
+    /**
+     * 解析配置中的默认连接名
+     * @return string
+     */
+    protected function defaultConnectionName(): string
+    {
+        $name = CacheConfig::getRedisClusterConfig()['default_connection'] ?? CacheConfig::DEFAULT_CONNECTION;
+
+        return is_string($name) && $name !== '' ? $name : CacheConfig::DEFAULT_CONNECTION;
+    }
+
+    /**
+     * 允许手动绑定的连接名白名单
+     * @return array
+     */
+    protected function allowedConnections(): array
+    {
+        $configured = CacheConfig::getRedisClusterConfig()['connections'] ?? [];
+        if (!empty($configured)) {
+            return array_values($configured);
+        }
+
+        try {
+            $redisConfig = config('database.redis', []);
+        } catch (\Exception $e) {
+            $redisConfig = [];
+        }
+        $redisConfig = is_array($redisConfig) ? $redisConfig : [];
+
+        $names = [];
+        foreach ($redisConfig as $key => $value) {
+            //排除 options 与 clusters 两个非连接键，并用 is_array 过滤 client 这类标量项
+            if ($key === 'options' || $key === 'clusters' || !is_array($value)) {
+                continue;
+            }
+            $names[] = (string) $key;
+        }
+
+        $clusters = is_array($redisConfig['clusters'] ?? null) ? $redisConfig['clusters'] : [];
+        foreach ($clusters as $clusterName => $clusterConfig) {
+            if ($clusterName === 'options' || !is_array($clusterConfig)) {
+                continue;
+            }
+            $names[] = (string) $clusterName;
+        }
+
+        return array_values(array_unique($names));
+    }
+
+    /**
+     * 校验连接名是否在白名单内
+     * @param string $name
+     * @throws \InvalidArgumentException
+     */
+    protected function assertConnectionAllowed(string $name)
+    {
+        $allowed = $this->allowedConnections();
+        if (in_array($name, $allowed, true)) {
+            return;
+        }
+
+        throw new \InvalidArgumentException(sprintf(
+            'Redis connection [%s] is not allowed for request cache cluster binding. Allowed connections: [%s].',
+            $name,
+            implode(', ', $allowed)
+        ));
+    }
+
+    protected function assertClusterSwitchingEnabled(): void
+    {
+        if (empty(CacheConfig::getRedisClusterConfig()['enabled'])) {
+            throw new \LogicException('Redis cluster switching is disabled.');
+        }
+    }
+
+    /**
+     * 生成带集群前缀的本地缓存 key
+     * @param string $key generateKey() 产出的 Redis key
+     * @return string
+     */
+    protected function localCacheKey(string $key): string
+    {
+        return hash('sha256', $this->effectiveConnectionName()) . ':' . $key;
     }
 
     /**
@@ -573,7 +708,7 @@ class RequestCache
         $strategy = CacheConfig::getStrategy();
 
         //尝试从本地缓存获取
-        $localValue = $this->localCache->get($key);
+        $localValue = $this->localCache->get($this->localCacheKey($key));
         if ($localValue !== null) {
             return $localValue;
         }
@@ -582,14 +717,14 @@ class RequestCache
         if ($strategy['primary'] === 'redis') {
             try {
                 //使用 Laravel Redis 连接
-                $redis = Redis::connection();
+                $redis = $this->connection();
                 $value = $redis->get($key);
 
                 if ($value) {
                     $data = $this->decodeStoredValue($value);
 
                     //将数据同步到本地缓存
-                    $this->localCache->set($key, $data);
+                    $this->localCache->set($this->localCacheKey($key), $data);
 
                     return $data;
                 }
@@ -619,7 +754,7 @@ class RequestCache
         //先尝试从本地缓存获取
         foreach ($items as $index => [$gateway, $params]) {
             $key = $this->generateKey($gateway, $params);
-            $localValue = $this->localCache->get($key);
+            $localValue = $this->localCache->get($this->localCacheKey($key));
             if ($localValue !== null) {
                 $result[$index] = $localValue;
             } else {
@@ -632,7 +767,7 @@ class RequestCache
         if (!empty($keysToGet) && $strategy['primary'] === 'redis') {
             try {
                 //使用 Laravel Redis 连接
-                $redis = Redis::connection();
+                $redis = $this->connection();
                 $values = $this->isClusterSafeMode()
                     ? array_map(function ($key) use ($redis) {
                         return $redis->get($key);
@@ -645,7 +780,7 @@ class RequestCache
                         $data = $this->decodeStoredValue($value);
 
                         //将数据同步到本地缓存
-                        $this->localCache->set($key, $data);
+                        $this->localCache->set($this->localCacheKey($key), $data);
 
                         //添加到结果
                         if (isset($keyMap[$key])) {
@@ -660,14 +795,14 @@ class RequestCache
 
                 foreach ($keysToGet as $key) {
                     try {
-                        $redis = Redis::connection();
+                        $redis = $this->connection();
                         $value = $redis->get($key);
                         if (!$value) {
                             continue;
                         }
 
                         $data = $this->decodeStoredValue($value);
-                        $this->localCache->set($key, $data);
+                        $this->localCache->set($this->localCacheKey($key), $data);
                         if (isset($keyMap[$key])) {
                             $result[$keyMap[$key]] = $data;
                         }
@@ -700,7 +835,7 @@ class RequestCache
             }
 
             // 使用 Laravel Redis 连接
-            $redis = Redis::connection();
+            $redis = $this->connection();
             $result = $redis->setex($key, $expire, $jsonData);
 
             //保存标签关联
@@ -712,7 +847,7 @@ class RequestCache
             }
 
             //将数据同步到本地缓存
-            $this->localCache->set($key, $data, $expire);
+            $this->localCache->set($this->localCacheKey($key), $data, $expire);
 
             return $result;
         } catch (\Exception $e) {
@@ -724,7 +859,7 @@ class RequestCache
                 return false;
             }
 
-            $this->localCache->set($key, $data, $expire);
+            $this->localCache->set($this->localCacheKey($key), $data, $expire);
             return true;
         }
     }
@@ -745,7 +880,7 @@ class RequestCache
             //如果使用 Redis 作为主缓存，使用管道批量操作
             if ($strategy['primary'] === 'redis' && !$this->isClusterSafeMode()) {
                 //使用 Laravel Redis 连接
-                $redis = Redis::connection();
+                $redis = $this->connection();
                 $pipeline = $redis->pipeline();
             }
 
@@ -785,7 +920,7 @@ class RequestCache
             if ($pipeline) {
                 $pipeline->exec();
                 foreach ($localWrites as [$key, $data, $expire]) {
-                    $this->localCache->set($key, $data, $expire);
+                    $this->localCache->set($this->localCacheKey($key), $data, $expire);
                 }
             }
         } catch (\Exception $e) {
@@ -808,7 +943,7 @@ class RequestCache
                         continue;
                     }
 
-                    $this->localCache->set($key, $data, $expire);
+                    $this->localCache->set($this->localCacheKey($key), $data, $expire);
                     $results[$index] = true;
                 }
                 return $results;
@@ -833,11 +968,11 @@ class RequestCache
     public function delete(string $gateway, array $params)
     {
         $key = $this->generateKey($gateway, $params);
-        $this->localCache->delete($key);
+        $this->localCache->delete($this->localCacheKey($key));
 
         try {
             //使用 Laravel Redis 连接
-            $redis = Redis::connection();
+            $redis = $this->connection();
             return $redis->del($key) > 0;
         } catch (\Exception $e) {
             return false;
@@ -1001,7 +1136,7 @@ class RequestCache
      */
     protected function batchDelete(array $keys, int $batchSize = 1000)
     {
-        $redis = Redis::connection();
+        $redis = $this->connection();
         return $this->batchDeleteOnConnection($redis, $keys, $batchSize);
     }
 
@@ -1068,7 +1203,7 @@ class RequestCache
             $keys = [];
 
             //使用 Laravel Redis 连接
-            $redis = Redis::connection();
+            $redis = $this->connection();
 
             foreach ($tags as $tag) {
                 $tagKey = $this->buildTagKey($tag);
@@ -1132,7 +1267,7 @@ class RequestCache
             $dailyKey = $this->buildStatsKey($type, $today);
 
             // 使用 Laravel Redis 连接
-            $redis = Redis::connection();
+            $redis = $this->defaultConnection();
 
             //增加统计计数
             $redis->incr($globalKey);
@@ -1161,7 +1296,7 @@ class RequestCache
 
         try {
             //使用 Laravel Redis 连接
-            $redis = Redis::connection();
+            $redis = $this->connection();
 
             for ($i = 0; $i < $retryTimes; $i++) {
                 if ($redis->set($lockKey, $lockValue, 'EX', $expire, 'NX')) {
@@ -1202,7 +1337,7 @@ class RequestCache
             LUA;
 
             //使用 Laravel Redis 连接
-            $redis = Redis::connection();
+            $redis = $this->connection();
 
             //直接执行 eval 命令
             return $redis->eval($script, 1, $lockKey, $lockValue, $expire) > 0;
@@ -1233,7 +1368,7 @@ class RequestCache
             LUA;
 
             //使用 Laravel Redis 连接
-            $redis = Redis::connection();
+            $redis = $this->connection();
 
             //直接执行 eval 命令
             return $redis->eval($script, 1, $lockKey, $lockValue) > 0;
@@ -1303,7 +1438,7 @@ class RequestCache
         try {
             $today = date('Y-m-d');
             //使用 Laravel Redis 连接
-            $redis = Redis::connection();
+            $redis = $this->defaultConnection();
 
             $stats = [
                 'hits' => (int) $redis->get($this->buildStatsKey('hits')) ?? 0,

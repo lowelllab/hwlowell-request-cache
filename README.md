@@ -17,6 +17,7 @@ RequestCache 是一个面向 Laravel 应用的请求级缓存包，支持 Redis 
 - 支持 `cluster_safe_mode`，在 Redis Cluster 中将多 key 操作降级为逐 key Redis 操作。
 - 支持 `shared_mode`，适用于多实例严格共享缓存部署。
 - 支持 `scan_strategy=all_nodes`，在 Redis Cluster 中进行全节点清理和聚合监控。
+- 支持多 Redis 集群手动切换，通过 `cluster()` 显式指定本次操作访问哪个集群。
 
 ## 环境要求
 
@@ -76,7 +77,7 @@ return [
 - `enabled`：是否启用 Redis Cluster 兼容模式。启用后，包会在生成缓存 key、标签 key、统计 key 和锁 key 时使用统一 hash tag，让相关 key 尽量落在同一个 slot，降低 `CROSSSLOT` 风险。
 - `hash_tag`：Redis Cluster hash tag 名称。设置为 `request-cache` 时，生成的 key 会包含类似 `{request-cache}` 的片段；为空时会使用默认的 `app_env_cache` 形式，避免不同应用或环境之间 key 冲突。
 - `cluster_safe_mode`：是否启用集群安全模式。启用后，涉及多个 key 的操作会降级为逐 key 操作，例如 `mget`、`mset`、标签清理和批量删除，从而避免 Redis Cluster 不允许跨 slot 多 key 命令的问题。
-- `scan_strategy`：控制基于 SCAN 的清理和监控范围。默认 `single_connection` 只处理当前 Redis 连接；设置为 `all_nodes` 时，会读取宿主 Laravel 项目的 `database.redis.clusters` 节点配置，并尝试遍历所有集群节点。
+- `scan_strategy`：控制基于 SCAN 的清理和监控范围。默认 `single_connection` 只处理当前 Redis 连接；设置为 `all_nodes` 时，会读取宿主 Laravel 项目的 `database.redis.clusters` 节点配置，并按 `default_connection` 的名字取出对应集群的节点列表逐节点遍历。通过 `cluster()` 绑定非默认集群时，该策略强制降级为 `single_connection`。
 
 `redis_cluster` 只控制本包的 Redis Cluster 兼容行为，不负责定义 Redis Cluster 节点。Redis 连接、节点列表和底层连接复用仍应配置在 Laravel 项目的 `config/database.php` 中，并由 Laravel Redis Manager 统一管理。
 
@@ -85,7 +86,7 @@ return [
 `scan_strategy` 用于控制基于 SCAN 的清理与监控范围：
 
 - `single_connection`：默认策略，只扫描当前 Redis 连接，并只返回当前连接视角的监控数据。
-- `all_nodes`：从 Laravel 的 `config('database.redis.clusters')` 读取 Redis Cluster 节点配置，逐节点执行 SCAN，并聚合内存、健康状态和 key 分布数据。
+- `all_nodes`：从 Laravel 的 `config('database.redis.clusters')` 按 `default_connection` 的名字读取对应集群的节点配置，逐节点执行 SCAN，并聚合内存、健康状态和 key 分布数据。绑定非默认集群时本策略强制降级为 `single_connection`。
 
 当 Cluster 节点无法解析时，包会安全回退到当前 Redis 连接。监控结果会通过 `scope` 字段标注实际视角：
 
@@ -123,6 +124,138 @@ return [
     ],
 ],
 ```
+
+## 多 Redis 集群手动切换
+
+宿主系统多地部署、同一套 Laravel 应用需要访问多个 Redis 集群时，可以通过 `cluster()` 显式指定本次缓存操作访问哪个集群。默认配置的 `default_connection` 为 `default`，因此默认配置向后兼容；显式修改 `default_connection` 后，未绑定数据读写、当前连接清理、统计与监控会真实切换到该连接。
+
+该能力依赖「同系统多集群」前提：各地集群必须共用同一套 `APP_KEY`、`APP_NAME`、`APP_ENV` 与缓存 `version`，`generateKey()` 才能在各集群上算出逐字节相同的缓存 key。跨系统访问不在本能力范围内。
+
+宿主 Laravel 项目 `config/database.php` 中的多集群配置形态：
+
+```php
+'clusters' => [
+    'default' => [
+        ['host' => env('REDIS_LOCAL_HOST_1'), 'port' => 6379],
+        ['host' => env('REDIS_LOCAL_HOST_2'), 'port' => 6379],
+    ],
+    'gz' => [
+        ['host' => env('REDIS_GZ_HOST_1'), 'port' => 6379],
+    ],
+    'hk' => [
+        ['host' => env('REDIS_HK_HOST_1'), 'port' => 6379],
+    ],
+],
+```
+
+本包 `config/request_cache.php` 中的对应配置：
+
+```php
+'redis_cluster' => [
+    'enabled' => true,
+    'hash_tag' => 'request-cache',
+    'cluster_safe_mode' => true,
+    'scan_strategy' => 'all_nodes',
+    'default_connection' => 'default',
+    'connections' => [],
+],
+```
+
+- `default_connection`：未显式调用 `cluster()` 时的数据读写、当前连接清理、统计与监控使用的权威 Laravel Redis 连接名，默认 `default`。
+- `connections`：允许手动切换的连接名白名单。留空表示自动推导——顶层仅接收数组连接并排除 `options`、`client`、`clusters`；`database.redis.clusters` 下仅接收数组值并显式排除 `options`。显式非数组配置抛出 `InvalidArgumentException`，绝不自动推导。
+- `enabled`：`false` 时 `cluster()` 抛出 `LogicException`，但未绑定路径仍按 `default_connection` 工作；只有 `true` 才允许显式多集群绑定。它不是仅控制 SCAN 的开关。
+
+### cluster() 用法
+
+```php
+use HwlowellRequestCache\RequestCache;
+
+// 默认读写 default 集群
+$data = RequestCache::get('users', ['id' => 1]);
+
+// 切换到广州集群读取
+$data = RequestCache::cluster('gz')->get('users', ['id' => 1]);
+
+// 切换到香港集群写入
+RequestCache::cluster('hk')->set('users', ['id' => 1], ['name' => '张三'], 600);
+```
+
+`cluster()` 返回的是携带集群绑定的**克隆实例**，绑定只在这条调用链上生效，用完即失效，不会污染容器中的 `request-cache` 单例。每次操作只连接一个集群，需要访问另一个集群时重新调用一次 `cluster()`。
+
+集群绑定对以下 API 全部生效：`get`、`set`、`delete`、`mget`、`mset`、`remember`、`warm`、`clearGateway`、`clearAll`、`clearTags`。
+
+### 能力边界
+
+本包只提供「这次操作连到哪个集群」的切换机制，不提供任何跨集群策略。以下能力**明确不提供**，全部由调用方在业务代码中自行实现：
+
+- 不提供自动兜底读取顺序：本地集群 miss 后不会自动去其他集群再读一次。
+- 不提供自动回填：从远端集群读到数据后不会自动写回本地集群。
+- 不提供删除广播与跨集群一致性保证：删除是否覆盖其他集群由调用方决定，本包不承诺可靠投递。
+- 不解析跨集群数据格式差异：各集群数据结构不一致时由读取方自行处理。
+- 不内置跨集群调用的超时、熔断与并发控制策略。
+
+`CacheMonitor` 不支持运行时 `cluster('x')` 指定目标，但其默认监控连接遵循 `default_connection`。
+
+### 业务侧兜底与回填示例
+
+兜底顺序、回填和回源全部由调用方编排：
+
+```php
+$params = ['id' => 1];
+
+// 优先读本机所在集群
+$data = RequestCache::get('users', $params);
+
+// 本地 miss，手动依次尝试其他区域集群
+if ($data === null) {
+    $data = RequestCache::cluster('gz')->get('users', $params);
+}
+
+if ($data === null) {
+    $data = RequestCache::cluster('hk')->get('users', $params);
+}
+
+// 读到远端数据后手动回填本地集群，回填就是一次普通写入
+if ($data !== null) {
+    RequestCache::cluster('default')->set('users', $params, $data, 600);
+}
+
+// 仍然读不到则回源数据库，由业务自行决定是否写缓存
+if ($data === null) {
+    $data = User::query()->find($params['id'])?->toArray();
+}
+```
+
+删除需要覆盖多个集群时同样由调用方显式遍历：
+
+```php
+foreach (['default', 'gz', 'hk'] as $name) {
+    RequestCache::cluster($name)->delete('users', $params);
+}
+```
+
+### 锁与统计的连接归属
+
+两者归属**故意不同**：
+
+- 分布式锁跟随目标集群。`remember()` 的锁保护的是目标集群上的写入，锁必须与被保护的数据落在同一集群，否则跨机房并发写同一集群时锁形同虚设。
+- 统计计数固定写入 `default_connection` 指定的权威默认连接；`CacheMonitor` 的统计、趋势与单连接 Redis 信息也读取该连接。
+
+### LocalCache 按集群隔离
+
+缓存 key 不含集群信息。为避免跨集群串用，本包使用 `hash('sha256', effectiveConnectionName()) . ':' . key` 构造本地缓存 key；不直接拼接连接名与分隔符，从而避免连接名含特殊字符时的边界碰撞。各集群在当前 PHP 进程内各持一份热点缓存，互不串用。
+
+`clearGateway()`、`clearAll()`、`clearTags()` 在指定集群时仍然执行全量 flush，一次清空进程内所有集群的本地缓存，确保清理后不会有任何集群的旧值残留。
+
+### 绑定集群时 all_nodes 被强制降级
+
+绑定非默认集群时，`scan_strategy` 强制降级为 `single_connection`：即使配置里填的是 `all_nodes`，`RequestCache::cluster('gz')->clearAll()` 也只在 `gz` 这一个连接上执行 SCAN，绝不会遍历节点、更不会跨集群扫描。降级只发生在运行时的扫描路径上，配置值本身不会被改写，`config('request_cache.cache.redis_cluster.scan_strategy')` 读出来仍是你写进去的那个值。
+
+`all_nodes` 只在未调用 `cluster()`、或绑定名恰好等于 `default_connection` 时生效，此时按 `default_connection` 的名字从 `database.redis.clusters` 取出对应集群的节点列表逐节点 SCAN。
+
+### 清理能力边界警示
+
+> **绑定集群后 `clearGateway()` 与 `clearAll()` 只覆盖该集群的第一个 master 节点。** Laravel 的 `PhpRedisClusterConnection::scan()` 在未指定节点时使用 `_masters()[0]`，本包不传节点参数，因此其余分片上的 key 扫描不到、也不会被删除，而方法仍然返回成功。这是已知且已接受的行为，不是缺陷：各集群数据不要求强一致，缓存 miss 可回源数据库，残留 key 会随 TTL 自然过期收敛。需要覆盖整个集群的清理时，请在未绑定的默认集群上使用 `scan_strategy => 'all_nodes'`。
 
 ## 基础使用
 
@@ -300,7 +433,7 @@ $cache->clearAll(false);
 $cache->clearAll(true);
 ```
 
-在 `scan_strategy=all_nodes` 模式下，`clearGateway()` 和 `clearAll()` 会遍历解析到的 Redis Cluster 节点，并在对应节点连接上删除扫描到的 key。
+在 `scan_strategy=all_nodes` 模式下，`clearGateway()` 和 `clearAll()` 会遍历 `default_connection` 对应集群的全部节点；通过 `cluster()` 绑定非默认集群时强制降级为 `single_connection`，只清理该集群第一个 master 节点上的 key，并在对应节点连接上删除扫描到的 key。
 
 ### 缓存统计
 
@@ -501,6 +634,7 @@ $cache->clearTags('product');
 8. Redis Cluster 部署中启用 `redis_cluster.enabled` 和 `cluster_safe_mode`。
 9. Redis Cluster 需要全节点清理或聚合监控时启用 `scan_strategy=all_nodes`。
 10. 多实例严格共享部署中启用 `shared_mode`，避免 Redis 写失败后出现本地伪成功。
+11. 多集群部署中，兜底读取顺序、回填和删除覆盖范围全部在业务代码中显式编排，避免跨集群串行读取拖慢主链路。
 
 ## 注意事项
 
@@ -511,6 +645,8 @@ $cache->clearTags('product');
 5. **错误处理：** 默认策略允许 Redis 不可用时使用当前进程本地缓存兜底；启用 `shared_mode` 后，Redis 写失败会返回失败，不会写入本地缓存并伪装成功。
 6. **版本控制：** 可通过缓存版本号实现整体换版，减少缓存不一致问题。
 7. **Redis Cluster 全节点扫描：** `all_nodes` 依赖 Laravel 的 `database.redis.clusters` 配置；解析失败时会回退当前连接视角。
+8. **多集群前提：** `cluster()` 依赖各地集群共用同一套 `APP_KEY`、`APP_NAME`、`APP_ENV` 与缓存 `version`，否则各集群算出的缓存 key 不同，跨集群读取必然 miss。
+9. **多集群边界：** 本包只提供集群切换机制，不提供自动兜底读取顺序、不提供自动回填、不提供删除广播与跨集群一致性保证。
 
 ## 配置选项
 
@@ -534,7 +670,9 @@ CacheConfig::$strategy = [
     'enabled' => false,                    // 是否启用 Redis Cluster 兼容模式
     'hash_tag' => null,                    // 为空时使用默认 app_env_cache 作为 hash tag
     'cluster_safe_mode' => true,           // 多 key 操作使用逐 key 兜底
-    'scan_strategy' => 'single_connection',// single_connection=当前连接；all_nodes=聚合 Laravel Redis Cluster 节点
+    'scan_strategy' => 'single_connection',// single_connection=当前连接；all_nodes=聚合 default_connection 对应集群的节点，绑定其他集群时强制降级
+    'default_connection' => 'default',     // 未显式指定集群时使用的连接名
+    'connections' => [],                   // 允许手动切换的连接名白名单，留空表示自动推导
 ],
 ```
 
@@ -585,6 +723,20 @@ php vendor\phpunit\phpunit\phpunit tests\RequestCacheClusterTest.php --filter "C
 ```
 
 ## 更新日志
+
+### v1.0.5
+
+- 新增多 Redis 集群手动切换：`RequestCache::cluster('gz')` 返回携带集群绑定的克隆实例；默认配置仍读写 `default`，显式 `default_connection` 控制未绑定路径。
+- 新增 `redis_cluster.default_connection` 与 `redis_cluster.connections` 两个配置项。
+- 明确边界：本包只提供集群切换机制，不提供自动兜底读取顺序、不提供自动回填、不提供删除广播与跨集群一致性保证。
+- 分布式锁跟随目标集群，统计计数固定写入默认连接。
+- `LocalCache` 按集群隔离，清理操作仍执行全量 flush。
+- `scan_strategy=all_nodes` 适用范围收窄：仅在未绑定或绑定名等于 `default_connection` 时生效，绑定其他集群时强制降级为 `single_connection`。
+- 清理能力边界：绑定集群后 `clearGateway()` 与 `clearAll()` 只覆盖该集群第一个 master 节点，残留 key 随 TTL 收敛。
+
+### v1.0.4
+
+- 版本号对齐至 `1.0.4`，无功能变更，功能内容见 `v1.0.3`。
 
 ### v1.0.3
 

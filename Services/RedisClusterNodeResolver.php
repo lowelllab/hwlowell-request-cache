@@ -8,18 +8,35 @@ use Illuminate\Support\Facades\Redis;
 class RedisClusterNodeResolver
 {
     protected array $clusterConfig;
+    protected ?string $connectionName = null;
     protected bool $usingCurrentConnectionFallback = false;
 
-    public function __construct(array $clusterConfig = null)
+    public function __construct(array $clusterConfig = null, ?string $connectionName = null)
     {
         $this->clusterConfig = $clusterConfig ?? CacheConfig::getRedisClusterConfig();
+
+        $connectionName = $connectionName === null ? null : trim($connectionName);
+        $this->connectionName = ($connectionName === null || $connectionName === '') ? null : $connectionName;
     }
 
     public function isAllNodesStrategy(): bool
     {
+        //绑定非默认集群时强制降级为 single_connection：配置里填 all_nodes 也无效
+        if ($this->connectionName !== null && $this->connectionName !== $this->defaultConnectionName()) {
+            return false;
+        }
+
         return !empty($this->clusterConfig['enabled'])
             && ($this->clusterConfig['scan_strategy'] ?? CacheConfig::SCAN_STRATEGY_SINGLE_CONNECTION)
                 === CacheConfig::SCAN_STRATEGY_ALL_NODES;
+    }
+
+    protected function defaultConnectionName(): string
+    {
+        $name = $this->clusterConfig['default_connection'] ?? CacheConfig::DEFAULT_CONNECTION;
+        $name = is_string($name) ? trim($name) : '';
+
+        return $name === '' ? CacheConfig::DEFAULT_CONNECTION : $name;
     }
 
     public function scanConnections(): array
@@ -44,7 +61,7 @@ class RedisClusterNodeResolver
 
     protected function currentConnection()
     {
-        return Redis::connection();
+        return Redis::connection($this->connectionName ?? $this->defaultConnectionName());
     }
 
     public function usesCurrentConnectionFallback(): bool
@@ -83,6 +100,12 @@ class RedisClusterNodeResolver
         $clusters = $this->readLaravelClusters();
         if (empty($clusters)) {
             return ['', []];
+        }
+
+        //按当前生效的连接名直取：绑定名优先，未绑定时用 default_connection 的值
+        $effectiveName = $this->connectionName ?? $this->defaultConnectionName();
+        if (isset($clusters[$effectiveName]) && is_array($clusters[$effectiveName])) {
+            return [$effectiveName, array_values($clusters[$effectiveName])];
         }
 
         if (array_key_exists('default', $clusters)) {

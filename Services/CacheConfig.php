@@ -8,6 +8,7 @@ class CacheConfig
 {
     public const SCAN_STRATEGY_SINGLE_CONNECTION = 'single_connection';
     public const SCAN_STRATEGY_ALL_NODES = 'all_nodes';
+    public const DEFAULT_CONNECTION = 'default';
 
     /**
      * 缓存策略
@@ -55,6 +56,8 @@ class CacheConfig
         'hash_tag' => null, //为空时使用 app_env_cache 作为 hash tag
         'cluster_safe_mode' => true, //多 key 操作使用逐 key 兜底
         'scan_strategy' => self::SCAN_STRATEGY_SINGLE_CONNECTION, //当前阶段使用当前连接执行 SCAN
+        'default_connection' => self::DEFAULT_CONNECTION, //未显式绑定集群时使用的连接名
+        'connections' => [], //允许手动切换的连接白名单，空数组表示自动推导
     ];
     
     /**
@@ -82,6 +85,32 @@ class CacheConfig
         $config['scan_strategy'] = in_array($strategy, $allowed, true)
             ? $strategy
             : self::SCAN_STRATEGY_SINGLE_CONNECTION;
+
+        $defaultConnection = $config['default_connection'] ?? self::DEFAULT_CONNECTION;
+        $defaultConnection = is_string($defaultConnection) ? trim($defaultConnection) : '';
+        $config['default_connection'] = $defaultConnection === ''
+            ? self::DEFAULT_CONNECTION
+            : $defaultConnection;
+
+        $connections = $config['connections'];
+        if (!is_array($connections)) {
+            throw new \InvalidArgumentException('request_cache.cache.redis_cluster.connections must be an array.');
+        }
+
+        $normalizedConnections = [];
+        foreach ($connections as $connectionName) {
+            if (!is_string($connectionName)) {
+                continue;
+            }
+
+            $connectionName = trim($connectionName);
+            if ($connectionName === '' || in_array($connectionName, $normalizedConnections, true)) {
+                continue;
+            }
+
+            $normalizedConnections[] = $connectionName;
+        }
+        $config['connections'] = $normalizedConnections;
 
         return $config;
     }

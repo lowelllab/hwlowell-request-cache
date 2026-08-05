@@ -99,6 +99,8 @@ return [
             'hash_tag' => null, //为空时自动使用 appName_appEnv_cache
             'cluster_safe_mode' => true, //多 key 操作逐 key 兜底
             'scan_strategy' => 'single_connection', //single_connection=当前连接扫描；all_nodes=遍历 Laravel Redis Cluster 配置中的节点扫描
+            'default_connection' => 'default', //未显式指定集群时使用的 Laravel Redis 连接名
+            'connections' => [], //允许手动切换的连接白名单，留空表示按 database.redis 自动推导
         ],
     ],
     'redis_search' => [
