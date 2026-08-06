@@ -2,6 +2,7 @@
 
 namespace HwlowellRequestCache;
 
+use Illuminate\Redis\Connections\PhpRedisConnection;
 use Illuminate\Support\Facades\Redis;
 use Illuminate\Http\Request;
 use Illuminate\Support\Str;
@@ -1021,7 +1022,7 @@ class RequestCache
     protected function scanKeysOnConnection($redis, string $pattern, int $count, int $batchSize): array
     {
         $keys = [];
-        $cursor = '0';
+        $cursor = self::initialScanCursor($redis);
         $redisPrefix = $this->redisPrefix();
 
         do {
@@ -1041,9 +1042,33 @@ class RequestCache
             }
 
             $keys = array_merge($keys, $batchKeys);
-        } while ($cursor != '0');
+        } while (!self::isScanCursorFinished($cursor));
 
         return $keys;
+    }
+
+    /**
+     * 解析 SCAN 游标初值
+     *
+     * phpredis 要求游标以 null 起始：传入 0 或 '0' 会被判定为迭代已结束并立刻返回
+     * false，导致整轮扫描一条 key 都取不到。predis 则需要字面量 '0'。
+     *
+     * @param mixed $redis
+     * @return string|null
+     */
+    public static function initialScanCursor($redis)
+    {
+        return $redis instanceof PhpRedisConnection ? null : '0';
+    }
+
+    /**
+     * 判断 SCAN 是否已遍历完成
+     * @param mixed $cursor
+     * @return bool
+     */
+    public static function isScanCursorFinished($cursor): bool
+    {
+        return $cursor === null || (int) $cursor === 0;
     }
 
     /**

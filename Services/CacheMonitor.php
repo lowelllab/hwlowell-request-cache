@@ -2,6 +2,7 @@
 
 namespace HwlowellRequestCache;
 
+use Illuminate\Redis\Connections\PhpRedisClusterConnection;
 use Illuminate\Support\Facades\Redis;
 
 class CacheMonitor
@@ -117,7 +118,7 @@ class CacheMonitor
                 : 0;
 
             return $stats;
-        } catch (\Exception $e) {
+        } catch (\Throwable $e) {
             return [
                 'hits' => 0,
                 'misses' => 0,
@@ -142,7 +143,7 @@ class CacheMonitor
             $pattern = $this->prefix . '*';
             $keys = $this->scanKeys($pattern);
             return count($keys);
-        } catch (\Exception $e) {
+        } catch (\Throwable $e) {
             return 0;
         }
     }
@@ -197,7 +198,7 @@ class CacheMonitor
                 'nodes' => $nodes,
                 'failed_nodes' => $failed,
             ];
-        } catch (\Exception $e) {
+        } catch (\Throwable $e) {
             return [
                 'error' => $e->getMessage(),
             ];
@@ -241,13 +242,12 @@ class CacheMonitor
 
                 foreach ($connections as $redis) {
                     try {
-                        $pong = $redis->ping();
-                        if ($pong === 'PONG' || $pong === true || $pong === '+PONG') {
+                        if ($this->isPong($this->pingConnection($redis))) {
                             $healthyNodes++;
                         } else {
                             $failedNodes++;
                         }
-                    } catch (\Exception $e) {
+                    } catch (\Throwable $e) {
                         $failedNodes++;
                     }
                 }
@@ -263,8 +263,7 @@ class CacheMonitor
 
             //检查 Redis 连接
             if (!$this->clusterNodeResolver->isAllNodesStrategy()) {
-                $pong = $this->connection()->ping();
-                if ($pong !== 'PONG') {
+                if (!$this->isPong($this->pingConnection($this->connection()))) {
                     return 'unavailable';
                 }
             }
@@ -287,9 +286,41 @@ class CacheMonitor
             }
 
             return 'healthy';
-        } catch (\Exception $e) {
+        } catch (\Throwable $e) {
             return 'error';
         }
+    }
+
+    /**
+     * 对指定连接执行 PING
+     *
+     * RedisCluster::ping() 必须携带路由目标，无参调用会抛出 ArgumentCountError；
+     * 这里用监控自身的 key 前缀定位节点，避免触碰业务 key。
+     *
+     * @param mixed $redis
+     * @return mixed
+     */
+    protected function pingConnection($redis)
+    {
+        if ($redis instanceof PhpRedisClusterConnection) {
+            return $redis->ping($this->prefix . 'ping');
+        }
+
+        return $redis->ping();
+    }
+
+    /**
+     * 判断 PING 响应是否正常
+     * @param mixed $pong
+     * @return bool
+     */
+    protected function isPong($pong): bool
+    {
+        if (is_bool($pong)) {
+            return $pong;
+        }
+
+        return is_string($pong) && strtoupper(ltrim($pong, '+')) === 'PONG';
     }
 
     /**
@@ -317,7 +348,7 @@ class CacheMonitor
             }
 
             return $trend;
-        } catch (\Exception $e) {
+        } catch (\Throwable $e) {
             return [];
         }
     }
@@ -360,7 +391,7 @@ class CacheMonitor
                 'nodes' => $scan['nodes'],
                 'failed_nodes' => $scan['failed_nodes'],
             ];
-        } catch (\Exception $e) {
+        } catch (\Throwable $e) {
             return [];
         }
     }
@@ -403,7 +434,7 @@ class CacheMonitor
     {
         try {
             return $this->connection()->info($section);
-        } catch (\Exception $e) {
+        } catch (\Throwable $e) {
             return ['error' => $e->getMessage()];
         }
     }
@@ -439,7 +470,7 @@ class CacheMonitor
         $connections = $this->clusterNodeResolver->scanConnections();
 
         foreach ($connections as $name => $redis) {
-            $cursor = '0';
+            $cursor = RequestCache::initialScanCursor($redis);
             $iterations = 0;
             $nodeKeys = [];
 
@@ -454,14 +485,14 @@ class CacheMonitor
                     $batch = $result[1];
                     $nodeKeys = array_merge($nodeKeys, $batch);
                     $iterations++;
-                } while ($cursor != '0');
+                } while (!RequestCache::isScanCursorFinished($cursor));
 
                 $keys = array_merge($keys, $nodeKeys);
                 $nodes[$name] = [
                     'matched_keys' => count($nodeKeys),
                     'scan_iterations' => $iterations,
                 ];
-            } catch (\Exception $e) {
+            } catch (\Throwable $e) {
                 $failed[$name] = $e->getMessage();
             }
         }
