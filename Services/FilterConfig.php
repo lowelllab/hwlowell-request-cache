@@ -81,7 +81,7 @@ class FilterConfig
         if (!isset(self::$allowedCharsPattern)) {
             self::init();
         }
-        return call_user_func_array([self, $name], $arguments);
+        return call_user_func_array([self::class, $name], $arguments);
     }
 
     /**

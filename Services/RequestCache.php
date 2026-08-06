@@ -514,13 +514,22 @@ class RequestCache
     }
 
     /**
+     * 存储信封版本号
+     */
+    const ENVELOPE_VERSION = 1;
+
+    /**
      * 解码 Redis 中存储的缓存值
+     *
+     * 返回命中条目而不是裸数据：裸数据无法区分「没有这个 key」与「缓存的就是
+     * null / 0」，会让空结果永远缓存不住，形成穿透。
+     *
      * @param mixed $value
-     * @return mixed
+     * @return array|null ['data' => mixed, 'expires_at' => int|null]，未命中返回 null
      */
     protected function decodeStoredValue($value)
     {
-        if (!$value) {
+        if ($value === null || $value === false || $value === '') {
             return null;
         }
 
@@ -534,17 +543,40 @@ class RequestCache
             }
         }
 
-        return json_decode($value, true);
+        $decoded = json_decode($value, true);
+
+        if (is_array($decoded)
+            && ($decoded['v'] ?? null) === self::ENVELOPE_VERSION
+            && array_key_exists('d', $decoded)
+        ) {
+            return [
+                'data' => $decoded['d'],
+                'expires_at' => isset($decoded['e']) ? (int) $decoded['e'] : null,
+            ];
+        }
+
+        //兼容 1.0.5 之前写入的裸 JSON；解析失败按未命中处理，避免把损坏的值当成缓存的 null
+        if ($decoded === null && strtolower(trim((string) $value)) !== 'null') {
+            return null;
+        }
+
+        return ['data' => $decoded, 'expires_at' => null];
     }
 
     /**
      * 编码即将写入 Redis 的缓存值
      * @param mixed $data
+     * @param int|null $expire 剩余生存秒数，用于本地缓存对齐 Redis 过期时间
      * @return string|false
      */
-    protected function encodeStoredValue($data)
+    protected function encodeStoredValue($data, int $expire = null)
     {
-        $jsonData = json_encode($data);
+        $envelope = ['v' => self::ENVELOPE_VERSION, 'd' => $data];
+        if ($expire !== null && $expire > 0) {
+            $envelope['e'] = time() + $expire;
+        }
+
+        $jsonData = json_encode($envelope);
         if ($jsonData === false || strlen($jsonData) > $this->sizeLimit) {
             return false;
         }
@@ -557,6 +589,28 @@ class RequestCache
         }
 
         return $jsonData;
+    }
+
+    /**
+     * 计算本地缓存副本可以存活多久
+     *
+     * 本地副本绝不能比 Redis 上的值活得更久，否则常驻进程（Octane、队列 worker）
+     * 会在 Redis key 过期后继续返回旧值。
+     *
+     * @param int|null $expiresAt
+     * @return int|null
+     */
+    protected function localCacheTtl($expiresAt)
+    {
+        $localTtl = CacheConfig::getLocalCacheConfig()['ttl'] ?? 300;
+
+        if ($expiresAt === null) {
+            return null;
+        }
+
+        $remaining = $expiresAt - time();
+
+        return $remaining < $localTtl ? $remaining : null;
     }
 
     /**
@@ -633,6 +687,38 @@ class RequestCache
     }
 
     /**
+     * 清洗 gateway 名称
+     *
+     * 生成 key 与按 pattern 清理必须走同一套规则，否则写进去的 key 清不掉，
+     * 而 gateway 中的通配符还会扩大 SCAN 的匹配范围。
+     *
+     * @param string $gateway
+     * @return string
+     */
+    public static function sanitizeGateway(string $gateway): string
+    {
+        return preg_replace('/[^a-zA-Z0-9_\-]/', '', $gateway);
+    }
+
+    /**
+     * 递归按键名排序，使参数顺序不影响缓存 key
+     * @param array $params
+     * @return array
+     */
+    protected static function sortParams(array $params): array
+    {
+        foreach ($params as $key => $value) {
+            if (is_array($value)) {
+                $params[$key] = self::sortParams($value);
+            }
+        }
+
+        ksort($params);
+
+        return $params;
+    }
+
+    /**
      * 限制数组深度
      * @param array &$array
      * @param int $maxDepth
@@ -664,27 +750,24 @@ class RequestCache
      */
     public function generateKey(string $gateway, array $params)
     {
-        //处理分页参数，只缓存第一页
-        if (isset($params['page']) && $params['page'] != 1) {
-            $params['page'] = 1;
-        }
-
         //过滤 gateway 参数，只允许字母、数字、下划线和连字符
-        $sanitizedGateway = preg_replace('/[^a-zA-Z0-9_\-]/', '', $gateway);
+        $sanitizedGateway = self::sanitizeGateway($gateway);
 
-        //强制校验字符开关
+        //参数指纹取自原始入参：filterValue() 是有损清洗，只用清洗结果做哈希会让
+        //不同的入参塌缩成同一个 key（例如所有大于 1000000 的 ID、所有只差 SQL
+        //关键字或标点的字符串），进而把别人的缓存返回给当前请求。
+        $fingerprint = hash('sha256', json_encode(self::sortParams($params)));
+
+        $filteredParams = $params;
         if ($this->forceValidate) {
-            //过滤参数
-            foreach ($params as $key => $value) {
-                $params[$key] = $this->filterValue($value);
+            foreach ($filteredParams as $key => $value) {
+                $filteredParams[$key] = $this->filterValue($value);
             }
-
-            //按键名排序
-            ksort($params);
         }
+        $filteredParams = self::sortParams($filteredParams);
 
         //使用 HMAC-SHA256 生成更安全的缓存键
-        $keyData = [$this->version, $sanitizedGateway, $params];
+        $keyData = [$this->version, $sanitizedGateway, $filteredParams, $fingerprint];
         //Laravel 环境配置
         try {
             $hashKey = config('app.key', 'default_cache_key') ?: 'default_cache_key';
@@ -705,13 +788,30 @@ class RequestCache
      */
     public function get(string $gateway, array $params)
     {
+        $entry = $this->getEntry($gateway, $params);
+
+        return $entry === null ? null : $entry['data'];
+    }
+
+    /**
+     * 获取缓存条目
+     *
+     * 与 get() 的区别在于能区分「未命中」与「命中且值为 null」，remember() 依赖
+     * 这一点才能把空结果缓存住。
+     *
+     * @param string $gateway
+     * @param array $params
+     * @return array|null ['data' => mixed, 'expires_at' => int|null]
+     */
+    protected function getEntry(string $gateway, array $params)
+    {
         $key = $this->generateKey($gateway, $params);
+        $localKey = $this->localCacheKey($key);
         $strategy = CacheConfig::getStrategy();
 
         //尝试从本地缓存获取
-        $localValue = $this->localCache->get($this->localCacheKey($key));
-        if ($localValue !== null) {
-            return $localValue;
+        if ($this->localCache->has($localKey)) {
+            return ['data' => $this->localCache->get($localKey), 'expires_at' => null];
         }
 
         //尝试从主缓存（Redis）获取
@@ -719,21 +819,20 @@ class RequestCache
             try {
                 //使用 Laravel Redis 连接
                 $redis = $this->connection();
-                $value = $redis->get($key);
+                $entry = $this->decodeStoredValue($redis->get($key));
 
-                if ($value) {
-                    $data = $this->decodeStoredValue($value);
+                if ($entry !== null) {
+                    if ($entry['expires_at'] !== null && $entry['expires_at'] <= time()) {
+                        return null;
+                    }
 
-                    //将数据同步到本地缓存
-                    $this->localCache->set($this->localCacheKey($key), $data);
+                    //将数据同步到本地缓存，存活时间不超过 Redis 上的剩余时间
+                    $this->localCache->set($localKey, $entry['data'], $this->localCacheTtl($entry['expires_at']));
 
-                    return $data;
+                    return $entry;
                 }
             } catch (\Exception $e) {
-                //Redis 异常，尝试使用备用缓存
-                if ($strategy['fallback']) {
-                    //备用缓存逻辑已在本地缓存中处理
-                }
+                //Redis 异常，本地缓存兜底已在上面处理
             }
         }
 
@@ -752,12 +851,14 @@ class RequestCache
         $keyMap = [];
         $strategy = CacheConfig::getStrategy();
 
-        //先尝试从本地缓存获取
+        //先尝试从本地缓存获取；未命中项保留 null 占位，保证返回值与入参下标一一对应
         foreach ($items as $index => [$gateway, $params]) {
             $key = $this->generateKey($gateway, $params);
-            $localValue = $this->localCache->get($this->localCacheKey($key));
-            if ($localValue !== null) {
-                $result[$index] = $localValue;
+            $localKey = $this->localCacheKey($key);
+            $result[$index] = null;
+
+            if ($this->localCache->has($localKey)) {
+                $result[$index] = $this->localCache->get($localKey);
             } else {
                 $keysToGet[] = $key;
                 $keyMap[$key] = $index;
@@ -776,17 +877,21 @@ class RequestCache
                     : $redis->mget($keysToGet);
 
                 foreach ($keysToGet as $i => $key) {
-                    $value = $values[$i];
-                    if ($value) {
-                        $data = $this->decodeStoredValue($value);
+                    $entry = $this->decodeStoredValue($values[$i] ?? null);
+                    if ($entry === null) {
+                        continue;
+                    }
 
-                        //将数据同步到本地缓存
-                        $this->localCache->set($this->localCacheKey($key), $data);
+                    if ($entry['expires_at'] !== null && $entry['expires_at'] <= time()) {
+                        continue;
+                    }
 
-                        //添加到结果
-                        if (isset($keyMap[$key])) {
-                            $result[$keyMap[$key]] = $data;
-                        }
+                    //将数据同步到本地缓存
+                    $this->localCache->set($this->localCacheKey($key), $entry['data'], $this->localCacheTtl($entry['expires_at']));
+
+                    //添加到结果
+                    if (isset($keyMap[$key])) {
+                        $result[$keyMap[$key]] = $entry['data'];
                     }
                 }
             } catch (\Exception $e) {
@@ -797,15 +902,18 @@ class RequestCache
                 foreach ($keysToGet as $key) {
                     try {
                         $redis = $this->connection();
-                        $value = $redis->get($key);
-                        if (!$value) {
+                        $entry = $this->decodeStoredValue($redis->get($key));
+                        if ($entry === null) {
                             continue;
                         }
 
-                        $data = $this->decodeStoredValue($value);
-                        $this->localCache->set($this->localCacheKey($key), $data);
+                        if ($entry['expires_at'] !== null && $entry['expires_at'] <= time()) {
+                            continue;
+                        }
+
+                        $this->localCache->set($this->localCacheKey($key), $entry['data'], $this->localCacheTtl($entry['expires_at']));
                         if (isset($keyMap[$key])) {
-                            $result[$keyMap[$key]] = $data;
+                            $result[$keyMap[$key]] = $entry['data'];
                         }
                     } catch (\Exception $ignored) {
                         //忽略单 key 读取异常
@@ -827,10 +935,12 @@ class RequestCache
      */
     public function set(string $gateway, array $params, $data, int $expire = null)
     {
+        $tags = $this->consumeTags();
+
         try {
             $key = $this->generateKey($gateway, $params);
             $expire = $expire ?? $this->defaultExpire * 60;
-            $jsonData = $this->encodeStoredValue($data);
+            $jsonData = $this->encodeStoredValue($data, $expire);
             if ($jsonData === false) {
                 return false;
             }
@@ -840,7 +950,7 @@ class RequestCache
             $result = $redis->setex($key, $expire, $jsonData);
 
             //保存标签关联
-            foreach ($this->tags as $tag) {
+            foreach ($tags as $tag) {
                 $tagKey = $this->buildTagKey($tag);
                 $redis->sadd($tagKey, $key);
                 //为标签设置过期时间，防止内存泄漏
@@ -866,6 +976,22 @@ class RequestCache
     }
 
     /**
+     * 取出并清空本次操作的标签
+     *
+     * 标签只对紧随其后的一次写入生效；不清空会让容器单例上的标签持续附加到
+     * 后续所有写入上。
+     *
+     * @return array
+     */
+    protected function consumeTags(): array
+    {
+        $tags = $this->tags;
+        $this->tags = [];
+
+        return $tags;
+    }
+
+    /**
      * 批量设置缓存
      * @param array $items 格式：[[gateway, params, data, expire], [gateway, params, data, expire], ...]
      * @return array 格式：[true, false, true, ...] 对应每个设置操作的结果
@@ -876,6 +1002,7 @@ class RequestCache
         $pipeline = null;
         $localWrites = [];
         $strategy = CacheConfig::getStrategy();
+        $tags = $this->consumeTags();
 
         try {
             //如果使用 Redis 作为主缓存，使用管道批量操作
@@ -892,7 +1019,7 @@ class RequestCache
                 $expire = isset($item[3]) ? $item[3] : null;
                 $expire = $expire ?? $this->defaultExpire * 60;
                 $key = $this->generateKey($gateway, $params);
-                $jsonData = $this->encodeStoredValue($data);
+                $jsonData = $this->encodeStoredValue($data, $expire);
                 if ($jsonData === false) {
                     $results[$index] = false;
                     continue;
@@ -903,7 +1030,7 @@ class RequestCache
                     $pipeline->setex($key, $expire, $jsonData);
 
                     //保存标签关联
-                    foreach ($this->tags as $tag) {
+                    foreach ($tags as $tag) {
                         $tagKey = $this->buildTagKey($tag);
                         $pipeline->sadd($tagKey, $key);
                         //为标签设置过期时间，防止内存泄漏
@@ -914,6 +1041,7 @@ class RequestCache
                     continue;
                 }
 
+                $this->tags = $tags;
                 $results[$index] = $this->set($gateway, $params, $data, $expire);
             }
 
@@ -953,6 +1081,7 @@ class RequestCache
             //Redis Cluster 跨 slot 时降级为逐 key 写入
             foreach ($items as $index => $item) {
                 $expire = isset($item[3]) ? $item[3] : null;
+                $this->tags = $tags;
                 $results[$index] = $this->set($item[0], $item[1], $item[2], $expire);
             }
         }
@@ -994,60 +1123,6 @@ class RequestCache
     }
 
     /**
-     * 使用 SCAN 命令获取匹配的键
-     * @param string $pattern
-     * @param int $count
-     * @param int $batchSize
-     * @return array
-     */
-    protected function scanKeys(string $pattern, int $count = 1000, int $batchSize = 10000)
-    {
-        $connections = $this->clusterNodeResolver->scanConnections();
-        if (count($connections) === 1) {
-            return $this->scanKeysOnConnection(reset($connections), $pattern, $count, $batchSize);
-        }
-
-        $result = $this->scanKeysOnConnections($connections, $pattern, $count, $batchSize);
-        return $result['keys'];
-    }
-
-    /**
-     * 使用指定连接执行 SCAN
-     * @param mixed $redis
-     * @param string $pattern
-     * @param int $count
-     * @param int $batchSize
-     * @return array
-     */
-    protected function scanKeysOnConnection($redis, string $pattern, int $count, int $batchSize): array
-    {
-        $keys = [];
-        $cursor = self::initialScanCursor($redis);
-        $redisPrefix = $this->redisPrefix();
-
-        do {
-            $fullPattern = $redisPrefix . $pattern;
-            $result = $redis->scan($cursor, ['match' => $fullPattern, 'count' => $count]);
-
-            if ($result === false) {
-                break;
-            }
-
-            $cursor = $result[0];
-            $batchKeys = $result[1];
-
-            //限制内存使用
-            if (count($keys) + count($batchKeys) > $batchSize) {
-                break;
-            }
-
-            $keys = array_merge($keys, $batchKeys);
-        } while (!self::isScanCursorFinished($cursor));
-
-        return $keys;
-    }
-
-    /**
      * 解析 SCAN 游标初值
      *
      * phpredis 要求游标以 null 起始：传入 0 或 '0' 会被判定为迭代已结束并立刻返回
@@ -1069,38 +1144,6 @@ class RequestCache
     public static function isScanCursorFinished($cursor): bool
     {
         return $cursor === null || (int) $cursor === 0;
-    }
-
-    /**
-     * 使用多个连接执行 SCAN
-     * @param array $connections
-     * @param string $pattern
-     * @param int $count
-     * @param int $batchSize
-     * @return array
-     */
-    protected function scanKeysOnConnections(array $connections, string $pattern, int $count, int $batchSize): array
-    {
-        $keys = [];
-        $keysByNode = [];
-        $failed = [];
-
-        foreach ($connections as $name => $redis) {
-            try {
-                $nodeKeys = $this->scanKeysOnConnection($redis, $pattern, $count, $batchSize);
-                $keysByNode[$name] = $nodeKeys;
-                $keys = array_merge($keys, $nodeKeys);
-            } catch (\Exception $e) {
-                $failed[$name] = $e->getMessage();
-            }
-        }
-
-        return [
-            'keys' => array_values(array_unique($keys)),
-            'keys_by_node' => $keysByNode,
-            'failed_nodes' => $failed,
-            'scanned_nodes' => count($connections) - count($failed),
-        ];
     }
 
     /**
@@ -1173,25 +1216,66 @@ class RequestCache
     protected function clearByPattern(string $pattern): bool
     {
         $connections = $this->clusterNodeResolver->scanConnections();
-        if (count($connections) === 1) {
-            $redis = reset($connections);
-            $keys = $this->scanKeysOnConnection($redis, $pattern, 1000, 10000);
-            $deleted = empty($keys) ? 0 : $this->batchDeleteOnConnection($redis, $keys);
-            $this->localCache->flush();
-            return empty($keys) || $deleted > 0;
-        }
-
-        $scan = $this->scanKeysOnConnections($connections, $pattern, 1000, 10000);
+        $found = 0;
         $deleted = 0;
-        foreach ($scan['keys_by_node'] as $nodeName => $keys) {
-            if (!isset($connections[$nodeName])) {
-                continue;
-            }
-            $deleted += $this->batchDeleteOnConnection($connections[$nodeName], $keys);
+
+        foreach ($connections as $redis) {
+            $nodeResult = $this->scanAndDeleteOnConnection($redis, $pattern);
+            $found += $nodeResult['found'];
+            $deleted += $nodeResult['deleted'];
         }
 
         $this->localCache->flush();
-        return empty($scan['keys']) || $deleted > 0;
+
+        return $found === 0 || $deleted > 0;
+    }
+
+    /**
+     * 边扫描边删除
+     *
+     * 不先把全部 key 收集到内存再删：那样既受 batchSize 上限约束会静默漏删，
+     * 也会在大 keyspace 上占用大量内存。
+     *
+     * @param mixed $redis
+     * @param string $pattern
+     * @param int $count 单轮 SCAN 的游标步长
+     * @param int $batchSize 单次 DEL 的最大 key 数
+     * @return array{found:int, deleted:int}
+     */
+    protected function scanAndDeleteOnConnection($redis, string $pattern, int $count = 1000, int $batchSize = 1000): array
+    {
+        $found = 0;
+        $deleted = 0;
+        $cursor = self::initialScanCursor($redis);
+        $fullPattern = $this->redisPrefix() . $pattern;
+        $buffer = [];
+
+        try {
+            do {
+                $result = $redis->scan($cursor, ['match' => $fullPattern, 'count' => $count]);
+
+                if ($result === false) {
+                    break;
+                }
+
+                $cursor = $result[0];
+                $buffer = array_merge($buffer, $result[1]);
+                $found += count($result[1]);
+
+                if (count($buffer) >= $batchSize) {
+                    $deleted += $this->batchDeleteOnConnection($redis, $buffer, $batchSize);
+                    $buffer = [];
+                }
+            } while (!self::isScanCursorFinished($cursor));
+
+            if (!empty($buffer)) {
+                $deleted += $this->batchDeleteOnConnection($redis, $buffer, $batchSize);
+            }
+        } catch (\Exception $e) {
+            //某个节点失败时保留已删除计数，由调用方按整体结果判断
+        }
+
+        return ['found' => $found, 'deleted' => $deleted];
     }
 
     /**
@@ -1203,12 +1287,19 @@ class RequestCache
     public function clearGateway(string $gateway, bool $allVersions = false)
     {
         try {
+            //与 generateKey() 使用同一套清洗规则：既保证含特殊字符的 gateway 能被清掉，
+            //也防止 gateway 里的 * ? [ 直接进入 SCAN pattern 扩大删除范围
+            $sanitizedGateway = self::sanitizeGateway($gateway);
+            if ($sanitizedGateway === '') {
+                return false;
+            }
+
             if ($allVersions) {
                 //清除所有版本的缓存
-                $pattern = $this->prefix . '*:' . $gateway . ':*';
+                $pattern = $this->prefix . '*:' . $sanitizedGateway . ':*';
             } else {
                 //只清除当前版本的缓存
-                $pattern = $this->prefix . $this->version . ':' . $gateway . ':*';
+                $pattern = $this->prefix . $this->version . ':' . $sanitizedGateway . ':*';
             }
             return $this->clearByPattern($pattern);
         } catch (\Exception $e) {
@@ -1314,8 +1405,13 @@ class RequestCache
      * @param int $retryDelay
      * @return string|null
      */
-    protected function acquireLock(string $key, int $expire = 10, int $retryTimes = 5, int $retryDelay = 100000)
+    protected function acquireLock(string $key, int $expire = null, int $retryTimes = null, int $retryDelay = null)
     {
+        $lockConfig = CacheConfig::getLockConfig();
+        $expire = $expire ?? (int) ($lockConfig['expire'] ?? 10);
+        $retryTimes = $retryTimes ?? (int) ($lockConfig['retryTimes'] ?? 5);
+        $retryDelay = $retryDelay ?? (int) ($lockConfig['retryDelay'] ?? 100000);
+
         $lockKey = $this->buildLockKey($key);
         $lockValue = Str::random(32); //随机值，防止误释放
 
@@ -1323,7 +1419,7 @@ class RequestCache
             //使用 Laravel Redis 连接
             $redis = $this->connection();
 
-            for ($i = 0; $i < $retryTimes; $i++) {
+            for ($i = 0; $i < max(1, $retryTimes); $i++) {
                 if ($redis->set($lockKey, $lockValue, 'EX', $expire, 'NX')) {
                     return $lockValue;
                 }
@@ -1335,6 +1431,45 @@ class RequestCache
             }
         } catch (\Exception $e) {
             //Redis 异常时，返回 null 表示获取锁失败
+        }
+
+        return null;
+    }
+
+    /**
+     * 等待持锁者把结果写入缓存
+     *
+     * 没有这一步时，重试窗口耗尽的等待方会直接执行回调：回调耗时一旦超过退避
+     * 总时长，防击穿就完全失效，并发进程会各跑一遍回调。
+     *
+     * @param string $gateway
+     * @param array $params
+     * @param string $key
+     * @return array|null 命中的缓存条目
+     */
+    protected function waitForCachedEntry(string $gateway, array $params, string $key)
+    {
+        $lockConfig = CacheConfig::getLockConfig();
+        $deadline = microtime(true) + (int) ($lockConfig['expire'] ?? 10);
+        $interval = max(10000, (int) ($lockConfig['retryDelay'] ?? 100000));
+        $lockKey = $this->buildLockKey($key);
+
+        while (microtime(true) < $deadline) {
+            usleep($interval);
+
+            $entry = $this->getEntry($gateway, $params);
+            if ($entry !== null) {
+                return $entry;
+            }
+
+            try {
+                //持锁者已经退出（正常释放或异常崩溃），没必要继续等
+                if (!$this->connection()->exists($lockKey)) {
+                    return null;
+                }
+            } catch (\Exception $e) {
+                return null;
+            }
         }
 
         return null;
@@ -1413,13 +1548,13 @@ class RequestCache
      */
     public function remember(string $gateway, array $params, callable $callback, int $expire = null)
     {
-        //尝试从缓存获取
-        $data = $this->get($gateway, $params);
+        //尝试从缓存获取；用条目而不是裸值判断，空结果才能被缓存住
+        $entry = $this->getEntry($gateway, $params);
 
-        if ($data !== null) {
+        if ($entry !== null) {
             //记录缓存命中
             $this->recordStats('hits');
-            return $data;
+            return $entry['data'];
         }
 
         //记录缓存未命中
@@ -1427,31 +1562,38 @@ class RequestCache
 
         //获取锁，防止缓存击穿
         $key = $this->generateKey($gateway, $params);
+        $tags = $this->tags;
         $lockValue = $this->acquireLock($key);
 
         if ($lockValue) {
             try {
                 //再次检查缓存（双重检查）
-                $data = $this->get($gateway, $params);
-                if ($data !== null) {
-                    return $data;
+                $entry = $this->getEntry($gateway, $params);
+                if ($entry !== null) {
+                    return $entry['data'];
                 }
 
                 //执行回调获取数据
                 $data = $callback();
 
                 //存入缓存
+                $this->tags = $tags;
                 $this->set($gateway, $params, $data, $expire);
             } finally {
                 //释放锁
                 $this->releaseLock($key, $lockValue);
             }
-        } else {
-            //锁获取失败，直接执行回调
-            $data = $callback();
+
+            return $data;
         }
 
-        return $data;
+        //抢锁失败：先等持锁者写完，实在等不到再自己回源
+        $entry = $this->waitForCachedEntry($gateway, $params, $key);
+        if ($entry !== null) {
+            return $entry['data'];
+        }
+
+        return $callback();
     }
 
     /**
@@ -1466,10 +1608,10 @@ class RequestCache
             $redis = $this->defaultConnection();
 
             $stats = [
-                'hits' => (int) $redis->get($this->buildStatsKey('hits')) ?? 0,
-                'misses' => (int) $redis->get($this->buildStatsKey('misses')) ?? 0,
-                'today_hits' => (int) $redis->get($this->buildStatsKey('hits', $today)) ?? 0,
-                'today_misses' => (int) $redis->get($this->buildStatsKey('misses', $today)) ?? 0,
+                'hits' => (int) $redis->get($this->buildStatsKey('hits')),
+                'misses' => (int) $redis->get($this->buildStatsKey('misses')),
+                'today_hits' => (int) $redis->get($this->buildStatsKey('hits', $today)),
+                'today_misses' => (int) $redis->get($this->buildStatsKey('misses', $today)),
             ];
 
             $stats['hit_rate'] = $stats['hits'] + $stats['misses'] > 0
@@ -1504,6 +1646,24 @@ class RequestCache
     }
 
     /**
+     * 解析 RediSearch 服务
+     *
+     * 该服务是可选组件，本包并不自带实现。缺失时抛 RuntimeException，让各
+     * search 方法沿用既有的 catch 分支返回降级值，而不是抛出调用方接不住的
+     * Error（catch(\Exception) 捕获不到 Error）。
+     *
+     * @return mixed
+     */
+    protected function searchService()
+    {
+        if (!class_exists('\\HwlowellRequestCache\\RediSearchService')) {
+            throw new \RuntimeException('RediSearchService is not installed.');
+        }
+
+        return \HwlowellRequestCache\RediSearchService::getInstance();
+    }
+
+    /**
      * 索引文档到 RediSearch
      * @param string $id
      * @param array $document
@@ -1512,7 +1672,7 @@ class RequestCache
     public function indexSearch($id, array $document)
     {
         try {
-            $searchService = \HwlowellRequestCache\RediSearchService::getInstance();
+            $searchService = $this->searchService();
             return $searchService->index($id, $document);
         } catch (\Exception $e) {
             return false;
@@ -1528,7 +1688,7 @@ class RequestCache
     public function search($query, array $options = [])
     {
         try {
-            $searchService = \HwlowellRequestCache\RediSearchService::getInstance();
+            $searchService = $this->searchService();
             return $searchService->search($query, $options);
         } catch (\Exception $e) {
             return [];
@@ -1543,7 +1703,7 @@ class RequestCache
     public function deleteSearch($id)
     {
         try {
-            $searchService = \HwlowellRequestCache\RediSearchService::getInstance();
+            $searchService = $this->searchService();
             return $searchService->delete($id);
         } catch (\Exception $e) {
             return false;
@@ -1557,7 +1717,7 @@ class RequestCache
     public function clearSearch()
     {
         try {
-            $searchService = \HwlowellRequestCache\RediSearchService::getInstance();
+            $searchService = $this->searchService();
             return $searchService->clear();
         } catch (\Exception $e) {
             return false;
@@ -1573,7 +1733,7 @@ class RequestCache
     public function advancedSearch(array $conditions, array $options = [])
     {
         try {
-            $searchService = \HwlowellRequestCache\RediSearchService::getInstance();
+            $searchService = $this->searchService();
             return $searchService->advancedSearch($conditions, $options);
         } catch (\Exception $e) {
             return [];
@@ -1588,7 +1748,7 @@ class RequestCache
     public function bulkIndexSearch(array $documents)
     {
         try {
-            $searchService = \HwlowellRequestCache\RediSearchService::getInstance();
+            $searchService = $this->searchService();
             return $searchService->bulkIndex($documents);
         } catch (\Exception $e) {
             return false;
@@ -1603,7 +1763,7 @@ class RequestCache
     public function bulkDeleteSearch(array $ids)
     {
         try {
-            $searchService = \HwlowellRequestCache\RediSearchService::getInstance();
+            $searchService = $this->searchService();
             return $searchService->bulkDelete($ids);
         } catch (\Exception $e) {
             return false;
@@ -1617,7 +1777,7 @@ class RequestCache
     public function countSearchDocuments()
     {
         try {
-            $searchService = \HwlowellRequestCache\RediSearchService::getInstance();
+            $searchService = $this->searchService();
             return $searchService->countDocuments();
         } catch (\Exception $e) {
             return 0;
@@ -1631,7 +1791,7 @@ class RequestCache
     public function existSearchIndex()
     {
         try {
-            $searchService = \HwlowellRequestCache\RediSearchService::getInstance();
+            $searchService = $this->searchService();
             return $searchService->existIndex();
         } catch (\Exception $e) {
             return false;
@@ -1645,7 +1805,7 @@ class RequestCache
     public function rebuildSearchIndex()
     {
         try {
-            $searchService = \HwlowellRequestCache\RediSearchService::getInstance();
+            $searchService = $this->searchService();
             return $searchService->rebuildIndex();
         } catch (\Exception $e) {
             return false;

@@ -38,11 +38,27 @@ class LocalCache
     {
         $this->cleanExpired();
         
-        if (isset($this->cache[$key])) {
+        if (array_key_exists($key, $this->cache)) {
             return $this->cache[$key];
         }
         
         return null;
+    }
+
+    /**
+     * 判断 key 是否存在
+     *
+     * 与 get() 区分开：缓存值本身可能就是 null，靠 get() 的返回值判断存在性会把
+     * 「缓存了 null」误判成未命中。
+     *
+     * @param string $key
+     * @return bool
+     */
+    public function has(string $key): bool
+    {
+        $this->cleanExpired();
+
+        return array_key_exists($key, $this->cache);
     }
     
     /**

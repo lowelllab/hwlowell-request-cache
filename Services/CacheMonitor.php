@@ -104,10 +104,10 @@ class CacheMonitor
             $today = date('Y-m-d');
             $redis = $this->connection();
             $stats = [
-                'hits' => (int) $redis->get($this->buildStatsKey('hits')) ?? 0,
-                'misses' => (int) $redis->get($this->buildStatsKey('misses')) ?? 0,
-                'today_hits' => (int) $redis->get($this->buildStatsKey('hits', $today)) ?? 0,
-                'today_misses' => (int) $redis->get($this->buildStatsKey('misses', $today)) ?? 0,
+                'hits' => (int) $redis->get($this->buildStatsKey('hits')),
+                'misses' => (int) $redis->get($this->buildStatsKey('misses')),
+                'today_hits' => (int) $redis->get($this->buildStatsKey('hits', $today)),
+                'today_misses' => (int) $redis->get($this->buildStatsKey('misses', $today)),
                 'cache_keys' => $this->getCacheKeyCount(),
                 'memory_usage' => $this->getMemoryUsage(),
                 'health_status' => $this->getHealthStatus(),

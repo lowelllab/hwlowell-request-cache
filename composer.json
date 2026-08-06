@@ -31,9 +31,7 @@
     },
     "autoload": {
         "psr-4": {
-            "HwlowellRequestCache\\": "Services/",
-            "HwlowellRequestCache\\Utils\\": "Utils/",
-            "HwlowellRequestCache\\Traits\\": "Traits/"
+            "HwlowellRequestCache\\": "Services/"
         }
     },
     "autoload-dev": {
