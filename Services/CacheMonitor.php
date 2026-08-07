@@ -22,15 +22,32 @@ class CacheMonitor
     protected $clusterNodeResolver;
     
     /**
+     * 当前实例生效的缓存配置
+     * @var CacheConfig
+     */
+    protected $cacheConfig;
+
+    /**
      * 构造函数
      * @param array|null $config
      */
     public function __construct(array $config = null)
     {
+        //显式传入的配置只属于当前实例；未传入时读取的是应用全局配置，回写静态属性才是安全的
+        $usesApplicationConfig = $config === null;
+
         $config = $config ?? $this->loadConfig();
-        RequestCache::loadConfig($config);
-        $this->prefix = RequestCache::resolvePrefix($config);
-        $this->clusterNodeResolver = new RedisClusterNodeResolver(CacheConfig::getRedisClusterConfig());
+
+        //走应用配置时直接并入全局，实例本身不留覆盖层，这样运行时改全局配置仍能影响该实例
+        $overrides = $config;
+        if ($usesApplicationConfig) {
+            RequestCache::loadConfig($config);
+            $overrides = [];
+        }
+
+        $this->cacheConfig = CacheConfig::make($overrides);
+        $this->prefix = RequestCache::resolvePrefix($config, $this->cacheConfig->redisCluster());
+        $this->clusterNodeResolver = new RedisClusterNodeResolver($this->cacheConfig->redisCluster());
     }
 
     /**
@@ -52,7 +69,7 @@ class CacheMonitor
      */
     protected function defaultConnectionName(): string
     {
-        $name = CacheConfig::getRedisClusterConfig()['default_connection'] ?? CacheConfig::DEFAULT_CONNECTION;
+        $name = $this->cacheConfig->redisCluster()['default_connection'] ?? CacheConfig::DEFAULT_CONNECTION;
 
         return is_string($name) && $name !== '' ? $name : CacheConfig::DEFAULT_CONNECTION;
     }

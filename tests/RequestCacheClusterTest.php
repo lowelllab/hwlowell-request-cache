@@ -4,6 +4,7 @@ namespace HwlowellRequestCache\Tests;
 
 use HwlowellRequestCache\CacheConfig;
 use HwlowellRequestCache\CacheMonitor;
+use HwlowellRequestCache\FilterConfig;
 use HwlowellRequestCache\RedisClusterNodeResolver;
 use HwlowellRequestCache\RequestCache;
 use HwlowellRequestCache\RequestCacheServiceProvider;
@@ -81,7 +82,7 @@ class RequestCacheClusterTest extends TestCase
 
     public function testConstructorLoadsCacheAndClusterConfig()
     {
-        new RequestCache($this->clusterConfig([
+        $cache = new RequestCache($this->clusterConfig([
             'hash_tag' => 'request-cache',
             'cluster_safe_mode' => true,
         ], [
@@ -91,9 +92,115 @@ class RequestCacheClusterTest extends TestCase
             ],
         ]));
 
-        $this->assertSame(5, CacheConfig::getLocalCacheConfig()['size']);
-        $this->assertTrue(CacheConfig::getRedisClusterConfig()['enabled']);
-        $this->assertSame('request-cache', CacheConfig::getRedisClusterConfig()['hash_tag']);
+        $this->assertSame(5, $cache->cacheConfig()->localCache()['size']);
+        $this->assertTrue($cache->cacheConfig()->redisCluster()['enabled']);
+        $this->assertSame('request-cache', $cache->cacheConfig()->redisCluster()['hash_tag']);
+    }
+
+    public function testConstructorConfigDoesNotLeakIntoGlobalState()
+    {
+        $globalLocalCache = CacheConfig::getLocalCacheConfig();
+        $globalCluster = CacheConfig::getRedisClusterConfig();
+        $globalStrategy = CacheConfig::getStrategy();
+
+        $cache = new RequestCache($this->clusterConfig([
+            'hash_tag' => 'isolated',
+            'default_connection' => 'gz',
+            'connections' => ['default', 'gz'],
+        ], [
+            'local_cache' => [
+                'ttl' => 7,
+                'size' => 3,
+            ],
+            'strategy' => [
+                'shared_mode' => true,
+            ],
+        ]));
+
+        //实例读到的是传入的配置
+        $this->assertSame(3, $cache->cacheConfig()->localCache()['size']);
+        $this->assertSame('gz', $cache->cacheConfig()->redisCluster()['default_connection']);
+        $this->assertTrue($cache->cacheConfig()->strategy()['shared_mode']);
+
+        //全局静态配置不受影响，容器里的其它实例不会被污染
+        $this->assertSame($globalLocalCache, CacheConfig::getLocalCacheConfig());
+        $this->assertSame($globalCluster, CacheConfig::getRedisClusterConfig());
+        $this->assertSame($globalStrategy, CacheConfig::getStrategy());
+    }
+
+    public function testInstanceWithoutOverrideFollowsRuntimeGlobalChanges()
+    {
+        $cache = new RequestCache();
+        $original = CacheConfig::getStrategy();
+
+        try {
+            CacheConfig::setStrategy(['shared_mode' => true]);
+            $this->assertTrue($cache->cacheConfig()->strategy()['shared_mode']);
+
+            CacheConfig::setStrategy(['shared_mode' => false]);
+            $this->assertFalse($cache->cacheConfig()->strategy()['shared_mode']);
+        } finally {
+            CacheConfig::setStrategy($original);
+        }
+    }
+
+    public function testInstanceOverrideWinsOverRuntimeGlobalChanges()
+    {
+        $cache = new RequestCache([
+            'cache' => [
+                'strategy' => ['shared_mode' => true],
+            ],
+        ]);
+        $original = CacheConfig::getStrategy();
+
+        try {
+            CacheConfig::setStrategy(['shared_mode' => false]);
+
+            $this->assertTrue($cache->cacheConfig()->strategy()['shared_mode']);
+            $this->assertFalse(CacheConfig::getStrategy()['shared_mode']);
+        } finally {
+            CacheConfig::setStrategy($original);
+        }
+    }
+
+    public function testTwoInstancesKeepIndependentConfiguration()
+    {
+        $first = new RequestCache($this->clusterConfig([
+            'hash_tag' => 'first',
+            'default_connection' => 'gz',
+            'connections' => ['default', 'gz'],
+        ]));
+        $second = new RequestCache($this->clusterConfig([
+            'hash_tag' => 'second',
+            'default_connection' => 'hk',
+            'connections' => ['default', 'hk'],
+        ]));
+
+        $this->assertSame('gz', $first->cacheConfig()->redisCluster()['default_connection']);
+        $this->assertSame('hk', $second->cacheConfig()->redisCluster()['default_connection']);
+        $this->assertStringStartsWith('{first}:', $first->generateKey('users', ['id' => 1]));
+        $this->assertStringStartsWith('{second}:', $second->generateKey('users', ['id' => 1]));
+    }
+
+    public function testFilterConfigDoesNotLeakIntoGlobalState()
+    {
+        $globalKeywords = FilterConfig::getSqlKeywords();
+
+        $cache = new RequestCache([
+            'filter' => [
+                'sql_keywords' => ['SELECT'],
+                'trim_whitespace' => false,
+            ],
+        ]);
+
+        $reflection = new ReflectionClass($cache);
+        $property = $reflection->getProperty('filterConfig');
+        $property->setAccessible(true);
+
+        $this->assertSame(['SELECT'], $property->getValue($cache)->sqlKeywords());
+        $this->assertFalse($property->getValue($cache)->shouldTrim());
+        $this->assertSame($globalKeywords, FilterConfig::getSqlKeywords());
+        $this->assertTrue(FilterConfig::shouldTrimWhitespace());
     }
 
     public function testConfigFileContainsClusterAndSharedModeOptions()
@@ -111,31 +218,31 @@ class RequestCacheClusterTest extends TestCase
 
     public function testStrategyLoadsSharedMode()
     {
-        new RequestCache($this->clusterConfig([], [
+        $cache = new RequestCache($this->clusterConfig([], [
             'strategy' => [
                 'shared_mode' => true,
             ],
         ]));
 
-        $this->assertTrue(CacheConfig::getStrategy()['shared_mode']);
+        $this->assertTrue($cache->cacheConfig()->strategy()['shared_mode']);
     }
 
     public function testScanStrategyLoadsAllNodes()
     {
-        new RequestCache($this->clusterConfig([
+        $cache = new RequestCache($this->clusterConfig([
             'scan_strategy' => 'all_nodes',
         ]));
 
-        $this->assertSame('all_nodes', CacheConfig::getRedisClusterConfig()['scan_strategy']);
+        $this->assertSame('all_nodes', $cache->cacheConfig()->redisCluster()['scan_strategy']);
     }
 
     public function testInvalidScanStrategyFallsBackToSingleConnection()
     {
-        new RequestCache($this->clusterConfig([
+        $cache = new RequestCache($this->clusterConfig([
             'scan_strategy' => 'invalid',
         ]));
 
-        $this->assertSame('single_connection', CacheConfig::getRedisClusterConfig()['scan_strategy']);
+        $this->assertSame('single_connection', $cache->cacheConfig()->redisCluster()['scan_strategy']);
     }
 
     public function testSetRedisClusterConfigNormalizesInvalidScanStrategy()
@@ -178,13 +285,13 @@ class RequestCacheClusterTest extends TestCase
 
     public function testClusterConnectionOptionsLoadFromRequestCacheConstructor()
     {
-        new RequestCache($this->clusterConfig([
+        $cache = new RequestCache($this->clusterConfig([
             'default_connection' => 'gz',
             'connections' => ['default', 'gz', 'hk'],
         ]));
 
-        $this->assertSame('gz', CacheConfig::getRedisClusterConfig()['default_connection']);
-        $this->assertSame(['default', 'gz', 'hk'], CacheConfig::getRedisClusterConfig()['connections']);
+        $this->assertSame('gz', $cache->cacheConfig()->redisCluster()['default_connection']);
+        $this->assertSame(['default', 'gz', 'hk'], $cache->cacheConfig()->redisCluster()['connections']);
     }
 
     public function testClusterConnectionDefaultNameTrimsAndFallsBack()

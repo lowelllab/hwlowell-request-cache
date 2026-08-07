@@ -23,10 +23,11 @@ class LocalCache
     
     /**
      * 构造函数
+     * @param array|null $config 实例级本地缓存配置，为空时使用全局配置
      */
-    public function __construct()
+    public function __construct(array $config = null)
     {
-        $this->config = CacheConfig::getLocalCacheConfig();
+        $this->config = array_merge(CacheConfig::getLocalCacheConfig(), $config ?? []);
     }
     
     /**

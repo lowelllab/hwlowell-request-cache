@@ -85,6 +85,18 @@ class RequestCache
     protected ?string $connectionName = null;
 
     /**
+     * 当前实例生效的缓存配置
+     * @var CacheConfig
+     */
+    protected $cacheConfig;
+
+    /**
+     * 当前实例生效的参数过滤配置
+     * @var FilterConfig
+     */
+    protected $filterConfig;
+
+    /**
      * 加载配置文件
      * @return array|null
      */
@@ -143,9 +155,10 @@ class RequestCache
     /**
      * 根据配置解析缓存前缀
      * @param array|null $config
+     * @param array|null $clusterConfig 已归一化的集群配置，为空时从 $config 或全局配置推导
      * @return string
      */
-    public static function resolvePrefix(array $config = null)
+    public static function resolvePrefix(array $config = null, array $clusterConfig = null)
     {
         if ($config === null && function_exists('config')) {
             try {
@@ -155,11 +168,15 @@ class RequestCache
             }
         }
 
+        $config = $config ?? [];
+        $clusterConfig = $clusterConfig
+            ?? $config['cache']['redis_cluster']
+            ?? CacheConfig::getRedisClusterConfig();
+
         $appName = self::envValue('APP_NAME', 'laravel');
         $appEnv = self::envValue('APP_ENV', 'local');
         $defaultPrefix = strtolower(str_replace(' ', '_', $appName)) . '_' . $appEnv . '_cache:';
         $prefix = $config['request_cache']['prefix'] ?? $defaultPrefix;
-        $clusterConfig = $config['cache']['redis_cluster'] ?? CacheConfig::getRedisClusterConfig();
 
         if (!empty($clusterConfig['enabled'])) {
             return self::prefixWithHashTag($prefix, $clusterConfig, $defaultPrefix);
@@ -196,6 +213,9 @@ class RequestCache
      */
     public function __construct(array $config = null)
     {
+        //显式传入的配置只属于当前实例；未传入时读取的是应用全局配置，回写静态属性才是安全的
+        $usesApplicationConfig = $config === null;
+
         //加载配置
         if ($config === null) {
             try {
@@ -206,12 +226,21 @@ class RequestCache
         }
 
         $config = $config ?? [];
-        self::loadConfig($config);
+
+        //走应用配置时直接并入全局，实例本身不留覆盖层，这样运行时改全局配置仍能影响该实例
+        $overrides = $config;
+        if ($usesApplicationConfig) {
+            self::loadConfig($config);
+            $overrides = [];
+        }
+
+        $this->cacheConfig = CacheConfig::make($overrides);
+        $this->filterConfig = FilterConfig::make($overrides);
 
         //Laravel 环境配置
         $this->appName = self::envValue('APP_NAME', 'laravel');
         $this->appEnv = self::envValue('APP_ENV', 'local');
-        $this->prefix = self::resolvePrefix($config);
+        $this->prefix = self::resolvePrefix($config, $this->cacheConfig->redisCluster());
 
         //加载配置
         if (isset($config['request_cache'])) {
@@ -228,8 +257,7 @@ class RequestCache
             if (isset($requestCacheConfig['enable_stats'])) {
                 $this->enableStats = $requestCacheConfig['enable_stats'];
             } else {
-                $statsConfig = CacheConfig::getStatsConfig();
-                $this->enableStats = !empty($statsConfig['enabled']);
+                $this->enableStats = !empty($this->cacheConfig->stats()['enabled']);
             }
 
             if (isset($requestCacheConfig['encrypt_data'])) {
@@ -245,9 +273,18 @@ class RequestCache
             }
         }
 
-        $this->localCache = new LocalCache();
+        $this->localCache = new LocalCache($this->cacheConfig->localCache());
 
-        $this->clusterNodeResolver = new RedisClusterNodeResolver(CacheConfig::getRedisClusterConfig());
+        $this->clusterNodeResolver = new RedisClusterNodeResolver($this->cacheConfig->redisCluster());
+    }
+
+    /**
+     * 获取当前实例生效的缓存配置
+     * @return CacheConfig
+     */
+    public function cacheConfig(): CacheConfig
+    {
+        return $this->cacheConfig;
     }
 
     /**
@@ -333,7 +370,7 @@ class RequestCache
         //返回克隆实例而非 $this：request-cache 注册为容器单例，写在 $this 上会让绑定跨调用粘连
         $clone = clone $this;
         $clone->connectionName = $name;
-        $clone->clusterNodeResolver = new RedisClusterNodeResolver(CacheConfig::getRedisClusterConfig(), $name);
+        $clone->clusterNodeResolver = new RedisClusterNodeResolver($this->cacheConfig->redisCluster(), $name);
 
         return $clone;
     }
@@ -371,7 +408,7 @@ class RequestCache
      */
     protected function defaultConnectionName(): string
     {
-        $name = CacheConfig::getRedisClusterConfig()['default_connection'] ?? CacheConfig::DEFAULT_CONNECTION;
+        $name = $this->cacheConfig->redisCluster()['default_connection'] ?? CacheConfig::DEFAULT_CONNECTION;
 
         return is_string($name) && $name !== '' ? $name : CacheConfig::DEFAULT_CONNECTION;
     }
@@ -382,7 +419,7 @@ class RequestCache
      */
     protected function allowedConnections(): array
     {
-        $configured = CacheConfig::getRedisClusterConfig()['connections'] ?? [];
+        $configured = $this->cacheConfig->redisCluster()['connections'] ?? [];
         if (!empty($configured)) {
             return array_values($configured);
         }
@@ -435,7 +472,7 @@ class RequestCache
 
     protected function assertClusterSwitchingEnabled(): void
     {
-        if (empty(CacheConfig::getRedisClusterConfig()['enabled'])) {
+        if (empty($this->cacheConfig->redisCluster()['enabled'])) {
             throw new \LogicException('Redis cluster switching is disabled.');
         }
     }
@@ -489,7 +526,7 @@ class RequestCache
      */
     protected function isClusterSafeMode()
     {
-        $clusterConfig = CacheConfig::getRedisClusterConfig();
+        $clusterConfig = $this->cacheConfig->redisCluster();
         return !empty($clusterConfig['enabled']) && !empty($clusterConfig['cluster_safe_mode']);
     }
 
@@ -499,7 +536,7 @@ class RequestCache
      */
     protected function allowsLocalFallbackWrite(): bool
     {
-        $strategy = CacheConfig::getStrategy();
+        $strategy = $this->cacheConfig->strategy();
         return !empty($strategy['fallback']) && empty($strategy['shared_mode']);
     }
 
@@ -602,7 +639,7 @@ class RequestCache
      */
     protected function localCacheTtl($expiresAt)
     {
-        $localTtl = CacheConfig::getLocalCacheConfig()['ttl'] ?? 300;
+        $localTtl = $this->cacheConfig->localCache()['ttl'] ?? 300;
 
         if ($expiresAt === null) {
             return null;
@@ -629,17 +666,17 @@ class RequestCache
 
         if (is_string($value)) {
             //去除首尾空格
-            if (FilterConfig::shouldTrimWhitespace()) {
+            if ($this->filterConfig->shouldTrim()) {
                 $value = trim($value);
             }
 
             //移除 HTML 标签
-            if (FilterConfig::shouldRemoveHtmlTags()) {
+            if ($this->filterConfig->shouldRemoveHtml()) {
                 $value = strip_tags($value);
             }
 
             //移除 SQL 语句关键字
-            $sqlKeywords = FilterConfig::getSqlKeywords();
+            $sqlKeywords = $this->filterConfig->sqlKeywords();
             if (!empty($sqlKeywords)) {
                 //构建单次正则表达式，减少多次 preg_replace 调用
                 $keywordsPattern = '/\b(' . implode('|', $sqlKeywords) . ')\b/i';
@@ -647,7 +684,7 @@ class RequestCache
             }
 
             //移除特殊字符，只保留字母、数字、下划线和中文字符
-            $value = preg_replace(FilterConfig::getAllowedCharsPattern(), '', $value);
+            $value = preg_replace($this->filterConfig->allowedCharsPattern(), '', $value);
 
             //移除潜在的 XSS 攻击向量
             $value = preg_replace($regexPatterns['javascript'], '', $value);
@@ -660,7 +697,7 @@ class RequestCache
             }
 
             //应用自定义过滤规则
-            $customFilters = FilterConfig::getCustomFilters();
+            $customFilters = $this->filterConfig->customFilters();
             foreach ($customFilters as $filter) {
                 $value = call_user_func($filter, $value);
             }
@@ -807,7 +844,7 @@ class RequestCache
     {
         $key = $this->generateKey($gateway, $params);
         $localKey = $this->localCacheKey($key);
-        $strategy = CacheConfig::getStrategy();
+        $strategy = $this->cacheConfig->strategy();
 
         //尝试从本地缓存获取
         if ($this->localCache->has($localKey)) {
@@ -849,7 +886,7 @@ class RequestCache
         $result = [];
         $keysToGet = [];
         $keyMap = [];
-        $strategy = CacheConfig::getStrategy();
+        $strategy = $this->cacheConfig->strategy();
 
         //先尝试从本地缓存获取；未命中项保留 null 占位，保证返回值与入参下标一一对应
         foreach ($items as $index => [$gateway, $params]) {
@@ -1001,7 +1038,7 @@ class RequestCache
         $results = [];
         $pipeline = null;
         $localWrites = [];
-        $strategy = CacheConfig::getStrategy();
+        $strategy = $this->cacheConfig->strategy();
         $tags = $this->consumeTags();
 
         try {
@@ -1372,7 +1409,7 @@ class RequestCache
      */
     protected function recordStats(string $type)
     {
-        $statsConfig = CacheConfig::getStatsConfig();
+        $statsConfig = $this->cacheConfig->stats();
         if (!$this->enableStats) {
             return;
         }
@@ -1407,7 +1444,7 @@ class RequestCache
      */
     protected function acquireLock(string $key, int $expire = null, int $retryTimes = null, int $retryDelay = null)
     {
-        $lockConfig = CacheConfig::getLockConfig();
+        $lockConfig = $this->cacheConfig->lock();
         $expire = $expire ?? (int) ($lockConfig['expire'] ?? 10);
         $retryTimes = $retryTimes ?? (int) ($lockConfig['retryTimes'] ?? 5);
         $retryDelay = $retryDelay ?? (int) ($lockConfig['retryDelay'] ?? 100000);
@@ -1449,7 +1486,7 @@ class RequestCache
      */
     protected function waitForCachedEntry(string $gateway, array $params, string $key)
     {
-        $lockConfig = CacheConfig::getLockConfig();
+        $lockConfig = $this->cacheConfig->lock();
         $deadline = microtime(true) + (int) ($lockConfig['expire'] ?? 10);
         $interval = max(10000, (int) ($lockConfig['retryDelay'] ?? 100000));
         $lockKey = $this->buildLockKey($key);

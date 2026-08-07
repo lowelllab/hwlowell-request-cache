@@ -69,7 +69,212 @@ class CacheConfig
         'max_results' => 1000, // 最大搜索结果数
         'timeout_ms' => 500, // 搜索超时时间（毫秒）
     ];
-    
+
+    /**
+     * 当前实例的配置覆盖层
+     * @var array
+     */
+    protected $overrides;
+
+    /**
+     * 构造实例级配置：只记录传入的配置，读取时叠加在当前全局配置之上，不回写静态属性
+     *
+     * 静态属性是整个应用共享的默认值。把构造实例时传入的配置直接写进静态属性，
+     * 会让一个临时实例的配置泄漏给容器单例和其它实例。反过来，读取时才叠加而
+     * 不是构造时快照，是为了让运行时改动全局配置（如 setStrategy()）仍能对
+     * 没有显式覆盖该段的实例生效。
+     *
+     * @param array $config
+     */
+    public function __construct(array $config = [])
+    {
+        $this->overrides = $config;
+
+        //提前解析一次，让非法配置在构造时就抛错，而不是等到第一次读取
+        $this->sections();
+    }
+
+    /**
+     * 构造实例级配置
+     * @param array $config
+     * @return static
+     */
+    public static function make(array $config = [])
+    {
+        return new static($config);
+    }
+
+    /**
+     * 读取当前全局配置快照
+     * @return array
+     */
+    protected static function currentSections(): array
+    {
+        return [
+            'strategy' => self::$strategy,
+            'localCache' => self::$localCache,
+            'lock' => self::$lock,
+            'stats' => self::$stats,
+            'redisCluster' => self::$redisCluster,
+            'redisSearch' => self::$redisSearch,
+        ];
+    }
+
+    /**
+     * 把配置数组叠加到给定的基准配置上
+     * @param array $base
+     * @param array $config
+     * @return array
+     */
+    protected static function resolveSections(array $base, array $config): array
+    {
+        $cacheConfig = $config['cache'] ?? [];
+        if (!is_array($cacheConfig)) {
+            $cacheConfig = [];
+        }
+
+        if (isset($cacheConfig['strategy'])) {
+            $base['strategy'] = array_merge($base['strategy'], $cacheConfig['strategy']);
+        }
+
+        if (isset($cacheConfig['local_cache'])) {
+            $base['localCache'] = array_merge($base['localCache'], $cacheConfig['local_cache']);
+        }
+
+        if (isset($cacheConfig['lock'])) {
+            $base['lock'] = array_merge($base['lock'], self::normalizeLockConfig($cacheConfig['lock']));
+        }
+
+        if (isset($cacheConfig['stats'])) {
+            $base['stats'] = array_merge($base['stats'], self::normalizeStatsConfig($cacheConfig['stats']));
+        }
+
+        if (isset($cacheConfig['redis_cluster'])) {
+            $base['redisCluster'] = self::normalizeRedisClusterConfig(array_merge(
+                $base['redisCluster'],
+                $cacheConfig['redis_cluster']
+            ));
+        }
+
+        if (isset($config['redis_search'])) {
+            $base['redisSearch'] = array_merge($base['redisSearch'], $config['redis_search']);
+        }
+
+        return $base;
+    }
+
+    /**
+     * 归一化锁配置，兼容下划线写法
+     * @param array $lockConfig
+     * @return array
+     */
+    protected static function normalizeLockConfig(array $lockConfig): array
+    {
+        $aliases = [
+            'retry_times' => 'retryTimes',
+            'retry_delay' => 'retryDelay',
+            'enable_extend' => 'enableExtend',
+            'extend_interval' => 'extendInterval',
+        ];
+
+        foreach ($aliases as $snake => $camel) {
+            if (isset($lockConfig[$snake])) {
+                $lockConfig[$camel] = $lockConfig[$snake];
+            }
+        }
+
+        return $lockConfig;
+    }
+
+    /**
+     * 归一化统计配置，兼容下划线写法
+     * @param array $statsConfig
+     * @return array
+     */
+    protected static function normalizeStatsConfig(array $statsConfig): array
+    {
+        $aliases = [
+            'global_expire' => 'globalExpire',
+            'daily_expire' => 'dailyExpire',
+        ];
+
+        foreach ($aliases as $snake => $camel) {
+            if (isset($statsConfig[$snake])) {
+                $statsConfig[$camel] = $statsConfig[$snake];
+            }
+        }
+
+        return $statsConfig;
+    }
+
+    /**
+     * 解析当前实例生效的各段配置
+     * @return array
+     */
+    protected function sections(): array
+    {
+        $current = self::currentSections();
+
+        return $this->overrides === []
+            ? $current
+            : self::resolveSections($current, $this->overrides);
+    }
+
+    /**
+     * 获取实例级缓存策略
+     * @return array
+     */
+    public function strategy(): array
+    {
+        return $this->sections()['strategy'];
+    }
+
+    /**
+     * 获取实例级本地缓存配置
+     * @return array
+     */
+    public function localCache(): array
+    {
+        return $this->sections()['localCache'];
+    }
+
+    /**
+     * 获取实例级分布式锁配置
+     * @return array
+     */
+    public function lock(): array
+    {
+        return $this->sections()['lock'];
+    }
+
+    /**
+     * 获取实例级统计配置
+     * @return array
+     */
+    public function stats(): array
+    {
+        return $this->sections()['stats'];
+    }
+
+    /**
+     * 获取实例级 Redis Cluster 配置
+     * @return array
+     */
+    public function redisCluster(): array
+    {
+        return $this->sections()['redisCluster'];
+    }
+
+    /**
+     * 获取实例级 RediSearch 配置
+     * @return array
+     */
+    public function rediSearch(): array
+    {
+        return $this->sections()['redisSearch'];
+    }
+
+
     /**
      * 归一化 Redis Cluster 配置
      * @param array $config
@@ -116,61 +321,22 @@ class CacheConfig
     }
 
     /**
-     * 从配置文件加载配置
+     * 从配置文件加载全局配置
+     *
+     * 这是唯一会改写静态属性的入口，供应用启动时（ServiceProvider）显式调用。
+     *
      * @param array $config
      */
     public static function loadFromConfig(array $config)
     {
-        if (isset($config['cache'])) {
-            $cacheConfig = $config['cache'];
-            
-            if (isset($cacheConfig['strategy'])) {
-                self::$strategy = array_merge(self::$strategy, $cacheConfig['strategy']);
-            }
-            
-            if (isset($cacheConfig['local_cache'])) {
-                self::$localCache = array_merge(self::$localCache, $cacheConfig['local_cache']);
-            }
-            
-            if (isset($cacheConfig['lock'])) {
-                $lockConfig = $cacheConfig['lock'];
-                if (isset($lockConfig['retry_times'])) {
-                    $lockConfig['retryTimes'] = $lockConfig['retry_times'];
-                }
-                if (isset($lockConfig['retry_delay'])) {
-                    $lockConfig['retryDelay'] = $lockConfig['retry_delay'];
-                }
-                if (isset($lockConfig['enable_extend'])) {
-                    $lockConfig['enableExtend'] = $lockConfig['enable_extend'];
-                }
-                if (isset($lockConfig['extend_interval'])) {
-                    $lockConfig['extendInterval'] = $lockConfig['extend_interval'];
-                }
-                self::$lock = array_merge(self::$lock, $lockConfig);
-            }
-            
-            if (isset($cacheConfig['stats'])) {
-                $statsConfig = $cacheConfig['stats'];
-                if (isset($statsConfig['global_expire'])) {
-                    $statsConfig['globalExpire'] = $statsConfig['global_expire'];
-                }
-                if (isset($statsConfig['daily_expire'])) {
-                    $statsConfig['dailyExpire'] = $statsConfig['daily_expire'];
-                }
-                self::$stats = array_merge(self::$stats, $statsConfig);
-            }
-            
-            if (isset($cacheConfig['redis_cluster'])) {
-                self::$redisCluster = self::normalizeRedisClusterConfig(array_merge(
-                    self::$redisCluster,
-                    $cacheConfig['redis_cluster']
-                ));
-            }
-        }
+        $sections = self::resolveSections(self::currentSections(), $config);
 
-        if (isset($config['redis_search'])) {
-            self::$redisSearch = array_merge(self::$redisSearch, $config['redis_search']);
-        }
+        self::$strategy = $sections['strategy'];
+        self::$localCache = $sections['localCache'];
+        self::$lock = $sections['lock'];
+        self::$stats = $sections['stats'];
+        self::$redisCluster = $sections['redisCluster'];
+        self::$redisSearch = $sections['redisSearch'];
     }
     
     /**

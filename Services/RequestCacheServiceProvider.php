@@ -15,15 +15,14 @@ class RequestCacheServiceProvider extends ServiceProvider
     {
         $this->mergeConfigFrom(__DIR__ . '/../config/request_cache.php', 'request_cache');
 
+        //不给构造函数传配置：容器单例应当跟随全局配置，
+        //这样运行时调用 CacheConfig::setXxx() 仍能影响它
         $this->app->singleton('request-cache', function ($app) {
-            $config = config('request_cache', []);
-            RequestCache::loadConfig($config);
-
-            return new RequestCache($config);
+            return new RequestCache();
         });
 
         $this->app->singleton('cache-monitor', function ($app) {
-            return new CacheMonitor(config('request_cache', []));
+            return new CacheMonitor();
         });
     }
 
