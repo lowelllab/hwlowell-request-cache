@@ -780,6 +780,24 @@ class RequestCache
     }
 
     /**
+     * 把任意入参序列化成用于哈希的规范字符串
+     *
+     * 不能直接用 json_encode()：它对非法 UTF-8、NAN/INF、超过 512 层的嵌套都会
+     * 返回 false，而 false 传进 hash() 会被当成空字符串，所有这类入参就塌缩成
+     * 同一个缓存 key，进而把别人的数据返回给当前请求。serialize() 原样保留字节
+     * 且不会失败，用它兜底；两种编码各自带前缀，避免跨编码撞串。
+     *
+     * @param mixed $value
+     * @return string
+     */
+    protected static function canonicalize($value): string
+    {
+        $encoded = json_encode($value, JSON_UNESCAPED_SLASHES);
+
+        return $encoded === false ? 's:' . serialize($value) : 'j:' . $encoded;
+    }
+
+    /**
      * 生成缓存 key
      * @param string $gateway
      * @param array $params
@@ -793,7 +811,7 @@ class RequestCache
         //参数指纹取自原始入参：filterValue() 是有损清洗，只用清洗结果做哈希会让
         //不同的入参塌缩成同一个 key（例如所有大于 1000000 的 ID、所有只差 SQL
         //关键字或标点的字符串），进而把别人的缓存返回给当前请求。
-        $fingerprint = hash('sha256', json_encode(self::sortParams($params)));
+        $fingerprint = hash('sha256', self::canonicalize(self::sortParams($params)));
 
         $filteredParams = $params;
         if ($this->forceValidate) {
@@ -812,7 +830,7 @@ class RequestCache
             //Laravel config function fails, use default
             $hashKey = 'default_cache_key';
         }
-        $hash = hash_hmac('sha256', json_encode($keyData), $hashKey);
+        $hash = hash_hmac('sha256', self::canonicalize($keyData), $hashKey);
         //在缓存 key 中包含版本信息
         return $this->prefix . $this->version . ':' . $sanitizedGateway . ':' . $hash;
     }
@@ -988,10 +1006,7 @@ class RequestCache
 
             //保存标签关联
             foreach ($tags as $tag) {
-                $tagKey = $this->buildTagKey($tag);
-                $redis->sadd($tagKey, $key);
-                //为标签设置过期时间，防止内存泄漏
-                $redis->expire($tagKey, $expire + 3600);
+                $this->touchTagIndex($redis, $this->buildTagKey($tag), $key, $expire);
             }
 
             //将数据同步到本地缓存
@@ -1026,6 +1041,71 @@ class RequestCache
         $this->tags = [];
 
         return $tags;
+    }
+
+    /**
+     * 把缓存 key 记入标签索引
+     *
+     * 索引用 ZSET 而不是 SET：成员的 score 存该 key 的绝对过期时间，每次写入
+     * 顺手剔除已过期的成员。用 SET 时成员只增不减，而标签本身的 TTL 又被每次
+     * 写入续期，热标签的索引会永不过期地无限膨胀。
+     *
+     * @param mixed $redis
+     * @param string $tagKey
+     * @param string $cacheKey
+     * @param int $expire
+     */
+    protected function touchTagIndex($redis, string $tagKey, string $cacheKey, int $expire): void
+    {
+        $now = time();
+
+        try {
+            $redis->zadd($tagKey, $now + $expire, $cacheKey);
+        } catch (\Exception $e) {
+            if (!$this->isWrongTypeException($e)) {
+                throw $e;
+            }
+
+            //1.0.6 之前标签索引是 SET，遇到遗留结构直接重建
+            $redis->del($tagKey);
+            $redis->zadd($tagKey, $now + $expire, $cacheKey);
+        }
+
+        //剔除已过期成员，索引大小跟随存活条目而不是历史写入总量
+        $redis->zremrangebyscore($tagKey, '-inf', (string) $now);
+        $redis->expire($tagKey, $expire + 3600);
+    }
+
+    /**
+     * 读取标签索引中的缓存 key
+     * @param mixed $redis
+     * @param string $tagKey
+     * @return array
+     */
+    protected function readTagIndex($redis, string $tagKey): array
+    {
+        try {
+            $members = $redis->zrange($tagKey, 0, -1);
+        } catch (\Exception $e) {
+            if (!$this->isWrongTypeException($e)) {
+                throw $e;
+            }
+
+            //兼容 1.0.6 之前写入的 SET 结构
+            $members = $redis->smembers($tagKey);
+        }
+
+        return is_array($members) ? $members : [];
+    }
+
+    /**
+     * 判断异常是否来自 Redis 的类型不匹配
+     * @param \Throwable $e
+     * @return bool
+     */
+    protected function isWrongTypeException(\Throwable $e): bool
+    {
+        return stripos($e->getMessage(), 'WRONGTYPE') !== false;
     }
 
     /**
@@ -1068,10 +1148,7 @@ class RequestCache
 
                     //保存标签关联
                     foreach ($tags as $tag) {
-                        $tagKey = $this->buildTagKey($tag);
-                        $pipeline->sadd($tagKey, $key);
-                        //为标签设置过期时间，防止内存泄漏
-                        $pipeline->expire($tagKey, $expire + 3600);
+                        $this->touchTagIndex($pipeline, $this->buildTagKey($tag), $key, $expire);
                     }
                     $localWrites[$index] = [$key, $data, $expire];
                     $results[$index] = true;
@@ -1360,23 +1437,20 @@ class RequestCache
 
             foreach ($tags as $tag) {
                 $tagKey = $this->buildTagKey($tag);
-                $tagKeys = $redis->smembers($tagKey);
-                $keys = array_merge($keys, $tagKeys);
-                //删除标签集合
+                $keys = array_merge($keys, $this->readTagIndex($redis, $tagKey));
+                //删除标签索引
                 $redis->del($tagKey);
             }
 
-            if (empty($keys)) {
-                $this->localCache->flush();
-                return true;
+            if (!empty($keys)) {
+                $this->batchDelete(array_unique($keys));
             }
 
-            $deleted = $this->batchDelete(array_unique($keys));
-            if ($deleted > 0) {
-                $this->localCache->flush();
-            }
+            $this->localCache->flush();
 
-            return $deleted > 0;
+            //删除条数不作为成功判据：索引里的 key 可能已经自然过期，DEL 返回 0
+            //并不代表清理失败。只有 Redis 异常才算失败，走下面的 catch。
+            return true;
         } catch (\Exception $e) {
             return false;
         }
@@ -1585,6 +1659,10 @@ class RequestCache
      */
     public function remember(string $gateway, array $params, callable $callback, int $expire = null)
     {
+        //先取走标签：remember() 有命中、等锁命中、直接回源三条提前返回的路径，
+        //在入口统一消费才能保证标签不会残留到实例上、泄漏给后续无关写入
+        $tags = $this->consumeTags();
+
         //尝试从缓存获取；用条目而不是裸值判断，空结果才能被缓存住
         $entry = $this->getEntry($gateway, $params);
 
@@ -1599,7 +1677,6 @@ class RequestCache
 
         //获取锁，防止缓存击穿
         $key = $this->generateKey($gateway, $params);
-        $tags = $this->tags;
         $lockValue = $this->acquireLock($key);
 
         if ($lockValue) {

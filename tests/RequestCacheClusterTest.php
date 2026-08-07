@@ -128,6 +128,98 @@ class RequestCacheClusterTest extends TestCase
         $this->assertSame($globalStrategy, CacheConfig::getStrategy());
     }
 
+    public function testNonUtf8ParametersDoNotCollapseIntoTheSameKey()
+    {
+        $cache = new RequestCache($this->clusterConfig(['hash_tag' => 'request-cache']));
+
+        //GBK 编码的两个不同词，都不是合法 UTF-8，json_encode() 对它们返回 false
+        $gbkA = "\xB2\xE2\xCA\xD4";
+        $gbkB = "\xB2\xFA\xC6\xB7";
+        $this->assertFalse(json_encode(['q' => $gbkA]));
+
+        $this->assertNotSame(
+            $cache->generateKey('users', ['q' => $gbkA]),
+            $cache->generateKey('users', ['q' => $gbkB])
+        );
+    }
+
+    public function testUnserialisableFloatParametersDoNotCollapseIntoTheSameKey()
+    {
+        $cache = new RequestCache($this->clusterConfig(['hash_tag' => 'request-cache']));
+
+        //NAN / INF 同样让 json_encode() 返回 false
+        $this->assertNotSame(
+            $cache->generateKey('users', ['score' => NAN]),
+            $cache->generateKey('users', ['score' => INF])
+        );
+    }
+
+    public function testRememberConsumesTagsOnACacheHit()
+    {
+        $redis = $this->redisFake([
+            'get' => json_encode(['v' => 1, 'd' => ['name' => 'Ada']]),
+        ]);
+        Redis::shouldReceive('connection')->andReturn($redis);
+        $cache = new RequestCache($this->clusterConfig(['hash_tag' => 'request-cache']));
+
+        $cache->tags('users')->remember('users', ['id' => 1], static fn () => ['name' => 'Ada'], 60);
+
+        $property = (new ReflectionClass($cache))->getProperty('tags');
+        $property->setAccessible(true);
+
+        $this->assertSame([], $property->getValue($cache));
+    }
+
+    public function testRememberConsumesTagsWhenItFallsThroughToTheCallback()
+    {
+        $redis = $this->redisFake([
+            'get' => null,
+            'set' => false,
+            'exists' => 0,
+        ]);
+        Redis::shouldReceive('connection')->andReturn($redis);
+        $cache = new RequestCache($this->clusterConfig(['hash_tag' => 'request-cache']));
+
+        //set() 返回 false 表示抢锁失败，remember() 会走等待再回源的分支
+        $cache->tags('users')->remember('users', ['id' => 1], static fn () => ['name' => 'Ada'], 60);
+
+        $property = (new ReflectionClass($cache))->getProperty('tags');
+        $property->setAccessible(true);
+
+        $this->assertSame([], $property->getValue($cache));
+    }
+
+    public function testTagIndexUsesASortedSetAndDropsExpiredMembers()
+    {
+        $redis = $this->redisFake([
+            'setex' => true,
+            'zadd' => 1,
+            'zremrangebyscore' => 0,
+            'expire' => true,
+        ]);
+        Redis::shouldReceive('connection')->andReturn($redis);
+        $cache = new RequestCache($this->clusterConfig(['hash_tag' => 'request-cache']));
+
+        $cache->tags('users')->set('users', ['id' => 1], ['name' => 'Ada'], 60);
+
+        $this->assertArrayHasKey('zadd', $redis->calls);
+        $this->assertArrayHasKey('zremrangebyscore', $redis->calls);
+        $this->assertArrayNotHasKey('sadd', $redis->calls);
+    }
+
+    public function testClearTagsReportsSuccessWhenTaggedKeysAlreadyExpired()
+    {
+        $redis = $this->redisFake([
+            'zrange' => ['{request-cache}:2.0:users:a'],
+            //成员已自然过期，DEL 返回 0
+            'del' => 0,
+        ]);
+        Redis::shouldReceive('connection')->andReturn($redis);
+        $cache = new RequestCache($this->clusterConfig(['hash_tag' => 'request-cache']));
+
+        $this->assertTrue($cache->clearTags('users'));
+    }
+
     public function testInstanceWithoutOverrideFollowsRuntimeGlobalChanges()
     {
         $cache = new RequestCache();
@@ -1360,7 +1452,7 @@ class RequestCacheClusterTest extends TestCase
     public function testClusterBindingRoutesClearTagsAndBatchDeleteThroughBoundConnection()
     {
         $redis = $this->redisFake([
-            'smembers' => ['{request-cache}:2.0:users:a'],
+            'zrange' => ['{request-cache}:2.0:users:a'],
             'del' => 1,
         ]);
         Redis::shouldReceive('connection')->twice()->with('gz')->andReturn($redis, $redis);
@@ -1370,7 +1462,7 @@ class RequestCacheClusterTest extends TestCase
         ])))->cluster('gz');
 
         $this->assertTrue($cache->clearTags('users'));
-        $this->assertArrayHasKey('smembers', $redis->calls);
+        $this->assertArrayHasKey('zrange', $redis->calls);
         $this->assertArrayHasKey('del', $redis->calls);
     }
 
@@ -1563,7 +1655,9 @@ class RequestCacheClusterTest extends TestCase
             'info' => ['used_memory' => 0, 'maxmemory' => 0],
             'ping' => 'PONG',
         ]);
-        Redis::shouldReceive('connection')->times(7)->with('gz')->andReturn($redis);
+        //getStats() 内部键数量与内存各取一次后复用；此前健康判定会各自再取一遍，
+        //同一次调用要连上 7 次并把整个 keyspace 扫两轮
+        Redis::shouldReceive('connection')->times(5)->with('gz')->andReturn($redis);
         $monitor = new CacheMonitor($this->clusterConfig([
             'enabled' => false,
             'default_connection' => 'gz',
@@ -1572,6 +1666,28 @@ class RequestCacheClusterTest extends TestCase
 
         $this->assertSame(5, $monitor->getStats()['hits']);
         $this->assertSame(5, $monitor->getTrend(1)[0]['hits']);
+    }
+
+    public function testGetStatsScansTheKeyspaceOnlyOnce()
+    {
+        $redis = $this->redisFake([
+            'get' => 1,
+            'scan' => ['0', ['{request-cache}:2.0:users:a']],
+            'info' => ['used_memory' => 0, 'maxmemory' => 0],
+            'ping' => 'PONG',
+        ]);
+        Redis::shouldReceive('connection')->with('gz')->andReturn($redis);
+        $monitor = new CacheMonitor($this->clusterConfig([
+            'enabled' => false,
+            'default_connection' => 'gz',
+            'connections' => ['default', 'gz'],
+        ]));
+
+        $stats = $monitor->getStats();
+
+        $this->assertSame(1, $stats['cache_keys']);
+        $this->assertCount(1, $redis->calls['scan']);
+        $this->assertCount(1, $redis->calls['info']);
     }
 
     public function testClusterBindingCacheMonitorUsesConfiguredDefaultConnectionForRedisInfoAndPing()

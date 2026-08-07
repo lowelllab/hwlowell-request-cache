@@ -202,7 +202,15 @@ class RedisClusterNodeResolver
             $baseConfig = [];
         }
 
-        Config::set("database.redis.{$name}", array_merge($baseConfig, ['database' => 0], $node));
+        $desired = array_merge($baseConfig, ['database' => 0], $node);
+
+        //配置没变就不要重写和 purge：监控类调用会反复走到这里，
+        //每次 purge 都会断掉已建立的节点连接再重连
+        if (Config::get("database.redis.{$name}") === $desired) {
+            return $name;
+        }
+
+        Config::set("database.redis.{$name}", $desired);
 
         try {
             $root = Redis::getFacadeRoot();

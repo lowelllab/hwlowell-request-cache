@@ -120,14 +120,23 @@ class CacheMonitor
         try {
             $today = date('Y-m-d');
             $redis = $this->connection();
+
+            //键数量与内存各取一次后复用：健康判定此前自己又各取一遍，
+            //一次 getStats() 会把整个 keyspace 扫两轮
+            $keyCount = $this->getCacheKeyCount();
+            $memory = $this->getMemoryUsage();
+
             $stats = [
                 'hits' => (int) $redis->get($this->buildStatsKey('hits')),
                 'misses' => (int) $redis->get($this->buildStatsKey('misses')),
                 'today_hits' => (int) $redis->get($this->buildStatsKey('hits', $today)),
                 'today_misses' => (int) $redis->get($this->buildStatsKey('misses', $today)),
-                'cache_keys' => $this->getCacheKeyCount(),
-                'memory_usage' => $this->getMemoryUsage(),
-                'health_status' => $this->getHealthStatus(),
+                'cache_keys' => $keyCount,
+                'memory_usage' => $memory,
+                'health_status' => $this->evaluateHealth(
+                    static fn () => $memory,
+                    static fn () => $keyCount
+                ),
             ];
 
             $stats['hit_rate'] = $stats['hits'] + $stats['misses'] > 0
@@ -157,9 +166,15 @@ class CacheMonitor
     public function getCacheKeyCount()
     {
         try {
-            $pattern = $this->prefix . '*';
-            $keys = $this->scanKeys($pattern);
-            return count($keys);
+            $count = 0;
+
+            //只累加数量：把整个 keyspace 的 key 收进数组再 count()，
+            //在百万级缓存上会把上百万个字符串堆进 PHP 内存
+            $this->eachScannedKey($this->prefix . '*', function () use (&$count) {
+                $count++;
+            });
+
+            return $count;
         } catch (\Throwable $e) {
             return 0;
         }
@@ -251,6 +266,25 @@ class CacheMonitor
      */
     public function getHealthStatus()
     {
+        //传闭包而不是取好的值：PING 阶段就能判定时不必再去扫 keyspace
+        return $this->evaluateHealth(
+            fn () => $this->getMemoryUsage(),
+            fn () => $this->getCacheKeyCount()
+        );
+    }
+
+    /**
+     * 判定健康状态
+     *
+     * 内存与键数量以闭包传入：单独调用时按需求值，保留 PING 阶段的短路；
+     * getStats() 则传入已取得的值，避免同一次调用里重复扫描整个 keyspace。
+     *
+     * @param callable $memoryProvider
+     * @param callable $keyCountProvider
+     * @return string
+     */
+    protected function evaluateHealth(callable $memoryProvider, callable $keyCountProvider): string
+    {
         try {
             if ($this->clusterNodeResolver->isAllNodesStrategy()) {
                 $connections = $this->clusterNodeResolver->scanConnections();
@@ -286,7 +320,7 @@ class CacheMonitor
             }
 
             //检查内存使用情况
-            $memory = $this->getMemoryUsage();
+            $memory = $memoryProvider();
             if (isset($memory['maxmemory']) && $memory['maxmemory'] > 0) {
                 $usedPercent = ($memory['used_memory'] / $memory['maxmemory']) * 100;
                 if ($usedPercent > 90) {
@@ -297,8 +331,7 @@ class CacheMonitor
             }
 
             //检查缓存键数量
-            $keyCount = $this->getCacheKeyCount();
-            if ($keyCount > 100000) {
+            if ($keyCountProvider() > 100000) {
                 return 'warning';
             }
 
@@ -377,18 +410,13 @@ class CacheMonitor
     public function getKeyDistribution()
     {
         try {
-            $scan = $this->scanKeys($this->prefix . '*', 1000, true);
-            $keys = $scan['keys'];
-
             $distribution = [];
-            foreach ($keys as $key) {
+
+            //边扫边聚合：内存占用取决于 version:gateway 组合数，而不是 key 总量
+            $scan = $this->eachScannedKey($this->prefix . '*', function ($key) use (&$distribution) {
                 [$version, $gateway] = $this->parseCacheKeyParts($key);
                 if ($version === null || $gateway === null) {
-                    continue;
-                }
-
-                if (!isset($distribution[$version])) {
-                    $distribution[$version] = [];
+                    return;
                 }
 
                 if (!isset($distribution[$version][$gateway])) {
@@ -396,7 +424,7 @@ class CacheMonitor
                 }
 
                 $distribution[$version][$gateway]++;
-            }
+            });
 
             if (!$this->clusterNodeResolver->isAllNodesStrategy()) {
                 return $distribution;
@@ -478,9 +506,8 @@ class CacheMonitor
      * @param bool $withMeta
      * @return array
      */
-    protected function scanKeys(string $pattern, int $count = 1000, bool $withMeta = false)
+    protected function eachScannedKey(string $pattern, callable $handler, int $count = 1000): array
     {
-        $keys = [];
         $nodes = [];
         $failed = [];
         $redisPrefix = $this->redisPrefix();
@@ -489,7 +516,7 @@ class CacheMonitor
         foreach ($connections as $name => $redis) {
             $cursor = RequestCache::initialScanCursor($redis);
             $iterations = 0;
-            $nodeKeys = [];
+            $matched = 0;
 
             try {
                 do {
@@ -499,14 +526,15 @@ class CacheMonitor
                     }
 
                     $cursor = $result[0];
-                    $batch = $result[1];
-                    $nodeKeys = array_merge($nodeKeys, $batch);
+                    foreach ($result[1] as $key) {
+                        $matched++;
+                        $handler($key, $name);
+                    }
                     $iterations++;
                 } while (!RequestCache::isScanCursorFinished($cursor));
 
-                $keys = array_merge($keys, $nodeKeys);
                 $nodes[$name] = [
-                    'matched_keys' => count($nodeKeys),
+                    'matched_keys' => $matched,
                     'scan_iterations' => $iterations,
                 ];
             } catch (\Throwable $e) {
@@ -514,14 +542,7 @@ class CacheMonitor
             }
         }
 
-        $keys = array_values(array_unique($keys));
-
-        if (!$withMeta) {
-            return $keys;
-        }
-
         return [
-            'keys' => $keys,
             'scope' => $this->scanScope($failed),
             'nodes' => $nodes,
             'failed_nodes' => $failed,
