@@ -58,7 +58,7 @@ class CacheMonitor
     {
         try {
             return config('request_cache', []);
-        } catch (\Exception $e) {
+        } catch (\Throwable $e) {
             $configPath = __DIR__ . '/../config/request_cache.php';
             return file_exists($configPath) ? require $configPath : [];
         }
@@ -188,7 +188,7 @@ class CacheMonitor
     {
         try {
             if (!$this->clusterNodeResolver->isAllNodesStrategy()) {
-                $info = $this->connection()->info('memory');
+                $info = RedisClientAdapter::wrap($this->connection())->info('memory');
                 return array_merge(['scope' => 'current_connection'], $this->normalizeMemoryInfo($info));
             }
 
@@ -200,11 +200,11 @@ class CacheMonitor
 
             foreach ($connections as $name => $redis) {
                 try {
-                    $info = $redis->info('memory');
+                    $info = RedisClientAdapter::wrap($redis)->info('memory', $this->prefix . 'ping');
                     $nodes[$name] = $this->normalizeMemoryInfo($info);
                     $total += (int) ($info['used_memory'] ?? 0);
                     $maxmemory += (int) ($info['maxmemory'] ?? 0);
-                } catch (\Exception $e) {
+                } catch (\Throwable $e) {
                     $failed[$name] = $e->getMessage();
                 }
             }
@@ -494,7 +494,7 @@ class CacheMonitor
     {
         try {
             return config('database.redis.options.prefix', '');
-        } catch (\Exception $e) {
+        } catch (\Throwable $e) {
             return '';
         }
     }

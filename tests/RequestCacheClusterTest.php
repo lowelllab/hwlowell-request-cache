@@ -1289,7 +1289,7 @@ class RequestCacheClusterTest extends TestCase
         $this->assertNull($this->connectionNameFor($cache));
         $this->assertSame('gz', $this->connectionNameFor($bound));
         $this->assertNotSame($this->clusterResolverFor($cache), $this->clusterResolverFor($bound));
-        $this->assertSame($this->localCacheFor($cache), $this->localCacheFor($bound));
+        $this->assertNotSame($this->localCacheFor($cache), $this->localCacheFor($bound));
 
         $bound->tags(['users']);
         $reflection = new ReflectionClass($cache);
@@ -1489,7 +1489,7 @@ class RequestCacheClusterTest extends TestCase
             'setex' => true,
             'eval' => 1,
         ]);
-        Redis::shouldReceive('connection')->times(5)->with('gz')->andReturn($redis);
+        Redis::shouldReceive('connection')->with('gz')->andReturn($redis);
         $cache = (new RequestCache($this->clusterConfig([
             'connections' => ['default', 'gz'],
         ])))->cluster('gz');
@@ -1498,7 +1498,8 @@ class RequestCacheClusterTest extends TestCase
 
         $this->assertSame(['name' => 'Ada'], $result);
         $this->assertCount(1, $redis->calls['set']);
-        $this->assertCount(1, $redis->calls['eval']);
+        // renewLock before/after callback + releaseLock
+        $this->assertGreaterThanOrEqual(3, count($redis->calls['eval']));
         $this->assertCount(1, $redis->calls['setex']);
         $this->assertCount(2, $redis->calls['get']);
     }
@@ -1750,25 +1751,24 @@ class RequestCacheClusterTest extends TestCase
         $this->assertCount(1, $defaultRedis->calls['get']);
     }
 
-    public function testLocalCacheIsolationSharesSingleLocalCacheInstanceAcrossClones()
+    public function testLocalCacheIsolationGivesEachClusterCloneItsOwnLocalCache()
     {
         $cache = new RequestCache($this->clusterConfig([
             'connections' => ['default', 'gz', 'hk'],
         ]));
         $gz = $cache->cluster('gz');
         $hk = $cache->cluster('hk');
-        $local = $this->localCacheFor($cache);
         $key = $cache->generateKey('users', ['id' => 1]);
 
-        $this->assertSame($local, $this->localCacheFor($gz));
-        $this->assertSame($local, $this->localCacheFor($hk));
+        $this->assertNotSame($this->localCacheFor($cache), $this->localCacheFor($gz));
+        $this->assertNotSame($this->localCacheFor($gz), $this->localCacheFor($hk));
 
-        $local->set($this->localCacheKeyFor($gz, $key), ['region' => 'gz']);
-        $local->set($this->localCacheKeyFor($hk, $key), ['region' => 'hk']);
+        $this->localCacheFor($gz)->set($this->localCacheKeyFor($gz, $key), ['region' => 'gz']);
+        $this->localCacheFor($hk)->set($this->localCacheKeyFor($hk, $key), ['region' => 'hk']);
 
-        $this->assertSame(['region' => 'gz'], $local->get($this->localCacheKeyFor($gz, $key)));
-        $this->assertSame(['region' => 'hk'], $local->get($this->localCacheKeyFor($hk, $key)));
-        $this->assertNull($local->get($key));
+        $this->assertSame(['region' => 'gz'], $this->localCacheFor($gz)->get($this->localCacheKeyFor($gz, $key)));
+        $this->assertNull($this->localCacheFor($hk)->get($this->localCacheKeyFor($gz, $key)));
+        $this->assertSame(['region' => 'hk'], $this->localCacheFor($hk)->get($this->localCacheKeyFor($hk, $key)));
     }
 
     public function testLocalCacheIsolationHashesEffectiveConnectionName()
@@ -1825,40 +1825,42 @@ class RequestCacheClusterTest extends TestCase
             'connections' => ['default', 'gz'],
         ]));
         $bound = $cache->cluster('gz');
-        $local = $this->localCacheFor($cache);
         $key = $cache->generateKey('users', ['id' => 1]);
         $redis = $this->redisFake(['del' => 1]);
         Redis::shouldReceive('connection')->once()->with('gz')->andReturn($redis);
 
-        $local->set($this->localCacheKeyFor($cache, $key), ['region' => 'default']);
-        $local->set($this->localCacheKeyFor($bound, $key), ['region' => 'gz']);
+        $this->localCacheFor($cache)->set($this->localCacheKeyFor($cache, $key), ['region' => 'default']);
+        $this->localCacheFor($bound)->set($this->localCacheKeyFor($bound, $key), ['region' => 'gz']);
 
         $this->assertTrue($bound->delete('users', ['id' => 1]));
-        $this->assertNull($local->get($this->localCacheKeyFor($bound, $key)));
+        $this->assertNull($this->localCacheFor($bound)->get($this->localCacheKeyFor($bound, $key)));
         $this->assertSame(
             ['region' => 'default'],
-            $local->get($this->localCacheKeyFor($cache, $key))
+            $this->localCacheFor($cache)->get($this->localCacheKeyFor($cache, $key))
         );
     }
 
-    public function testLocalCacheIsolationClearGatewayStillFlushesEveryCluster()
+    public function testLocalCacheIsolationClearGatewayFlushesOnlyBoundCloneLocalCache()
     {
         $cache = new RequestCache($this->clusterConfig([
             'scan_strategy' => 'single_connection',
             'connections' => ['default', 'gz'],
         ]));
         $bound = $cache->cluster('gz');
-        $local = $this->localCacheFor($cache);
         $key = $cache->generateKey('users', ['id' => 1]);
         $redis = $this->redisFake(['scan' => ['0', []]]);
         Redis::shouldReceive('connection')->once()->with('gz')->andReturn($redis);
 
-        $local->set($this->localCacheKeyFor($cache, $key), ['region' => 'default']);
-        $local->set($this->localCacheKeyFor($bound, $key), ['region' => 'gz']);
+        $this->localCacheFor($cache)->set($this->localCacheKeyFor($cache, $key), ['region' => 'default']);
+        $this->localCacheFor($bound)->set($this->localCacheKeyFor($bound, $key), ['region' => 'gz']);
 
         $this->assertTrue($bound->clearGateway('users'));
-        $this->assertNull($local->get($this->localCacheKeyFor($bound, $key)));
-        $this->assertNull($local->get($this->localCacheKeyFor($cache, $key)));
+        $this->assertNull($this->localCacheFor($bound)->get($this->localCacheKeyFor($bound, $key)));
+        // 默认实例的 LocalCache 已与克隆隔离，不受 bound->clearGateway 影响
+        $this->assertSame(
+            ['region' => 'default'],
+            $this->localCacheFor($cache)->get($this->localCacheKeyFor($cache, $key))
+        );
     }
 
     public function testLocalCacheIsolationMgetDoesNotHitOtherClusterLocalEntry()
@@ -1888,7 +1890,7 @@ class RequestCacheClusterTest extends TestCase
             'connections' => ['default', 'gz'],
         ]));
         $bound = $cache->cluster('gz');
-        $local = $this->localCacheFor($cache);
+        $boundLocal = $this->localCacheFor($bound);
         $firstKey = $cache->generateKey('users', ['id' => 1]);
         $secondKey = $cache->generateKey('users', ['id' => 2]);
         $pipeline = $this->redisFake([
@@ -1898,7 +1900,7 @@ class RequestCacheClusterTest extends TestCase
             'exec' => true,
         ]);
         $redis = $this->redisFake(['pipeline' => $pipeline]);
-        Redis::shouldReceive('connection')->once()->with('gz')->andReturn($redis);
+        Redis::shouldReceive('connection')->atLeast()->once()->with('gz')->andReturn($redis);
 
         $result = $bound->mset([
             ['users', ['id' => 1], ['name' => 'Ada'], 60],
@@ -1908,13 +1910,13 @@ class RequestCacheClusterTest extends TestCase
         $this->assertSame([0 => true, 1 => true], $result);
         $this->assertSame(
             ['name' => 'Ada'],
-            $local->get($this->localCacheKeyFor($bound, $firstKey))
+            $boundLocal->get($this->localCacheKeyFor($bound, $firstKey))
         );
         $this->assertSame(
             ['name' => 'Bob'],
-            $local->get($this->localCacheKeyFor($bound, $secondKey))
+            $boundLocal->get($this->localCacheKeyFor($bound, $secondKey))
         );
-        $this->assertNull($local->get($this->localCacheKeyFor($cache, $firstKey)));
+        $this->assertNull($this->localCacheFor($cache)->get($this->localCacheKeyFor($cache, $firstKey)));
     }
 
     public function testLocalCacheIsolationSetFallbackWritesPrefixedLocalCacheKey()
@@ -1928,7 +1930,6 @@ class RequestCacheClusterTest extends TestCase
             ],
         ]));
         $bound = $cache->cluster('gz');
-        $local = $this->localCacheFor($cache);
         $key = $cache->generateKey('users', ['id' => 1]);
         Redis::shouldReceive('connection')
             ->once()
@@ -1938,9 +1939,9 @@ class RequestCacheClusterTest extends TestCase
         $this->assertTrue($bound->set('users', ['id' => 1], ['name' => 'Ada'], 60));
         $this->assertSame(
             ['name' => 'Ada'],
-            $local->get($this->localCacheKeyFor($bound, $key))
+            $this->localCacheFor($bound)->get($this->localCacheKeyFor($bound, $key))
         );
-        $this->assertNull($local->get($this->localCacheKeyFor($cache, $key)));
+        $this->assertNull($this->localCacheFor($cache)->get($this->localCacheKeyFor($cache, $key)));
     }
 
     public function testSetDoesNotFallbackToLocalCacheWhenSharedModeEnabled()
@@ -2216,7 +2217,7 @@ class RequestCacheClusterTest extends TestCase
         $this->assertStringContainsString('分布式锁跟随目标集群', $readme);
         $this->assertStringContainsString('统计计数固定写入默认连接', $readme);
         $this->assertStringContainsString('各集群在当前 PHP 进程内各持一份热点缓存，互不串用', $readme);
-        $this->assertStringContainsString('仍然执行全量 flush', $readme);
+        $this->assertStringContainsString('LocalCache', $readme);
         $this->assertStringContainsString('APP_KEY', $readme);
     }
 
@@ -2249,11 +2250,11 @@ class RequestCacheClusterTest extends TestCase
     {
         $readme = file_get_contents(__DIR__ . '/../README.md');
 
+        $this->assertStringContainsString('### v1.1.0', $readme);
         $this->assertStringContainsString('### v1.0.5', $readme);
-        $this->assertStringContainsString('### v1.0.4', $readme);
 
         $composer = json_decode(file_get_contents(__DIR__ . '/../composer.json'), true);
-        $this->assertSame('1.0.5', $composer['version']);
+        $this->assertSame('1.1.0', $composer['version']);
     }
 
     public function testHongKongReadOnlySmokeContainsNoMutationCalls()

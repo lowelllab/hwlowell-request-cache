@@ -245,7 +245,7 @@ foreach (['default', 'gz', 'hk'] as $name) {
 
 缓存 key 不含集群信息。为避免跨集群串用，本包使用 `hash('sha256', effectiveConnectionName()) . ':' . key` 构造本地缓存 key；不直接拼接连接名与分隔符，从而避免连接名含特殊字符时的边界碰撞。各集群在当前 PHP 进程内各持一份热点缓存，互不串用。
 
-`clearGateway()`、`clearAll()`、`clearTags()` 在指定集群时仍然执行全量 flush，一次清空进程内所有集群的本地缓存，确保清理后不会有任何集群的旧值残留。
+`cluster()` 返回的克隆实例各自持有独立的 `LocalCache`（`__clone`），互不共享容量与条目；清理操作只 flush 当前实例自己的本地缓存。
 
 ### 绑定集群时 all_nodes 被强制降级
 
@@ -375,8 +375,9 @@ $results = $cache->mget([
 ]);
 
 foreach ($results as $index => $userProfile) {
-    if ($userProfile) {
-        echo '用户 ' . ($index + 1) . '：' . $userProfile['name'] . PHP_EOL;
+    // 用 !== null 判断：0 / false / '' / null 都可能是合法缓存值
+    if ($userProfile !== null) {
+        echo '用户 ' . ($index + 1) . '：' . ($userProfile['name'] ?? '') . PHP_EOL;
     } else {
         echo '用户 ' . ($index + 1) . ' 缓存未命中' . PHP_EOL;
     }
@@ -413,7 +414,7 @@ $cache->tags('user', 'settings')->set('user_settings', ['user_id' => 1], [
 // 清理所有带 user 标签的缓存
 $cache->clearTags('user');
 
-// 清理同时关联 user/profile 的缓存
+// 清理同时关联 user 与 profile 的缓存（多标签取交集）
 $cache->clearTags(['user', 'profile']);
 ```
 
@@ -640,7 +641,7 @@ $cache->clearTags('product');
 
 1. **Redis 依赖：** 默认使用 Redis 作为主缓存，请确保 Redis 服务可用。
 2. **数据大小限制：** 默认单条缓存大小限制为 1MB，超过限制的数据不会写入缓存。
-3. **参数过滤：** 默认会过滤缓存参数，移除潜在安全风险。
+3. **参数过滤：** `force_validate` 默认关闭；开启后只影响 key 哈希输入的清洗形态，指纹已保证唯一性，不构成安全边界。
 4. **加密依赖：** 数据加密依赖 Laravel 的 `encrypt` 和 `decrypt` 函数；非 Laravel 环境下会自动跳过。
 5. **错误处理：** 默认策略允许 Redis 不可用时使用当前进程本地缓存兜底；启用 `shared_mode` 后，Redis 写失败会返回失败，不会写入本地缓存并伪装成功。
 6. **版本控制：** 可通过缓存版本号实现整体换版，减少缓存不一致问题。
@@ -724,13 +725,23 @@ php vendor\phpunit\phpunit\phpunit tests\RequestCacheClusterTest.php --filter "C
 
 ## 更新日志
 
+### v1.1.0
+
+- 新增 `RedisClientAdapter` / `CacheLogger`：抹平 Redis 与 RedisCluster API 差异，关键降级与失败路径可观测。
+- 全量 `catch (\Throwable)`，避免集群上 `Error` / `ArgumentCountError` 直穿成 500。
+- `mset()` 在 Cluster 上不再调用不存在的 `pipeline()`；标签索引写入移出管道，遗留 SET→ZSET 可迁移。
+- 缓存值编码支持非 UTF-8 的 serialize 信封兜底；`force_validate` 默认改为 `false`。
+- `clearTags([...])` 多标签改为真正交集；`remember()` 持锁 TTL 拉长并在回调前后续期。
+- `all_nodes` 节点连接继承 `database.redis.clusters.options` 凭据；`cluster()` 克隆隔离 `LocalCache`。
+- 构造时只传 `cache` 段会从应用配置补齐 `request_cache` 段，避免 version 等静默丢失。
+
 ### v1.0.5
 
 - 新增多 Redis 集群手动切换：`RequestCache::cluster('gz')` 返回携带集群绑定的克隆实例；默认配置仍读写 `default`，显式 `default_connection` 控制未绑定路径。
 - 新增 `redis_cluster.default_connection` 与 `redis_cluster.connections` 两个配置项。
 - 明确边界：本包只提供集群切换机制，不提供自动兜底读取顺序、不提供自动回填、不提供删除广播与跨集群一致性保证。
 - 分布式锁跟随目标集群，统计计数固定写入默认连接。
-- `LocalCache` 按集群隔离，清理操作仍执行全量 flush。
+- `LocalCache` 按集群隔离；`cluster()` 克隆各自持有独立本地缓存。
 - `scan_strategy=all_nodes` 适用范围收窄：仅在未绑定或绑定名等于 `default_connection` 时生效，绑定其他集群时强制降级为 `single_connection`。
 - 清理能力边界：绑定集群后 `clearGateway()` 与 `clearAll()` 只覆盖该集群第一个 master 节点，残留 key 随 TTL 收敛。
 

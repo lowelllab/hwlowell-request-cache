@@ -80,7 +80,7 @@ class RedisClusterNodeResolver
                 continue;
             }
 
-            $names[] = $this->registerNodeConfig($this->nodeConnectionName($clusterName, $index), $node);
+            $names[] = $this->registerNodeConfig($this->nodeConnectionName($clusterName, $index), $node, $clusterName);
         }
 
         if (empty($names)) {
@@ -91,6 +91,7 @@ class RedisClusterNodeResolver
 
         //配置写入后 manager 可能还看不见这些连接名，重建一次再试
         if ($missingConfig && $this->refreshRedisManager()) {
+            CacheLogger::warning('Redis manager refreshed to register cluster node connections');
             $connections = $this->connectNodes($names, $missingConfig);
         }
 
@@ -113,7 +114,7 @@ class RedisClusterNodeResolver
                 $connections[$name] = Redis::connection($name);
             } catch (\InvalidArgumentException $e) {
                 $missingConfig = true;
-            } catch (\Exception $e) {
+            } catch (\Throwable $e) {
                 // Skip failed nodes; callers can fall back when none resolve.
             }
         }
@@ -143,7 +144,7 @@ class RedisClusterNodeResolver
             Redis::clearResolvedInstance('redis');
 
             return true;
-        } catch (\Exception $e) {
+        } catch (\Throwable $e) {
             // 重建失败时保持原状，由调用方回退当前连接
             return false;
         }
@@ -153,7 +154,7 @@ class RedisClusterNodeResolver
     {
         try {
             return config('database.redis.clusters', []);
-        } catch (\Exception $e) {
+        } catch (\Throwable $e) {
             return [];
         }
     }
@@ -193,16 +194,34 @@ class RedisClusterNodeResolver
         return "request_cache_cluster_node_{$safeClusterName}_{$index}";
     }
 
-    protected function registerNodeConfig(string $name, array $node): string
+    protected function registerNodeConfig(string $name, array $node, string $clusterName = ''): string
     {
         $baseConfig = [];
         try {
             $baseConfig = Config::get('database.redis.default', []);
-        } catch (\Exception $e) {
+        } catch (\Throwable $e) {
             $baseConfig = [];
         }
 
-        $desired = array_merge($baseConfig, ['database' => 0], $node);
+        $clusterOptions = [];
+        try {
+            $clusterOptions = Config::get('database.redis.clusters.options', []) ?: [];
+        } catch (\Throwable $e) {
+            $clusterOptions = [];
+        }
+
+        if ($clusterName !== '') {
+            try {
+                $namedOptions = Config::get("database.redis.clusters.{$clusterName}.options", []);
+                if (is_array($namedOptions) && $namedOptions !== []) {
+                    $clusterOptions = array_merge($clusterOptions, $namedOptions);
+                }
+            } catch (\Throwable $e) {
+                //忽略单集群 options 读取失败
+            }
+        }
+
+        $desired = array_merge($baseConfig, $clusterOptions, ['database' => 0], $node);
 
         //配置没变就不要重写和 purge：监控类调用会反复走到这里，
         //每次 purge 都会断掉已建立的节点连接再重连
@@ -217,7 +236,7 @@ class RedisClusterNodeResolver
             if (is_object($root) && method_exists($root, 'purge')) {
                 Redis::purge($name);
             }
-        } catch (\Exception $e) {
+        } catch (\Throwable $e) {
             // Purge is best-effort and only needed when the manager supports it.
         }
 

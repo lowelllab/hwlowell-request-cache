@@ -18,7 +18,7 @@ return [
         'default_expire' => 5,
 
         //强制校验字符开关
-        'force_validate' => true,
+        'force_validate' => false,
 
         //启用缓存统计
         'enable_stats' => false,

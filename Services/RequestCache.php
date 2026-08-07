@@ -47,7 +47,7 @@ class RequestCache
     /**
      * 强制校验字符开关
      */
-    protected $forceValidate = true;
+    protected $forceValidate = false;
 
     /**
      * 缓存标签
@@ -115,7 +115,7 @@ class RequestCache
                 if (file_exists($configPath)) {
                     return require $configPath;
                 }
-            } catch (\Exception $e) {
+            } catch (\Throwable $e) {
                 // 忽略错误
             }
         }
@@ -163,7 +163,7 @@ class RequestCache
         if ($config === null && function_exists('config')) {
             try {
                 $config = config('request_cache', []);
-            } catch (\Exception $e) {
+            } catch (\Throwable $e) {
                 $config = [];
             }
         }
@@ -220,12 +220,27 @@ class RequestCache
         if ($config === null) {
             try {
                 $config = config('request_cache', []);
-            } catch (\Exception $e) {
+            } catch (\Throwable $e) {
                 $config = $this->loadConfigFile();
             }
         }
 
         $config = $config ?? [];
+        if (!isset($config['request_cache'])) {
+            try {
+                $fromApp = function_exists('config') ? config('request_cache.request_cache') : null;
+            } catch (\Throwable $e) {
+                $fromApp = null;
+            }
+            if (is_array($fromApp) && $fromApp !== []) {
+                $config['request_cache'] = $fromApp;
+            } else {
+                $defaults = $this->loadConfigFile();
+                if (is_array($defaults['request_cache'] ?? null)) {
+                    $config['request_cache'] = $defaults['request_cache'];
+                }
+            }
+        }
 
         //走应用配置时直接并入全局，实例本身不留覆盖层，这样运行时改全局配置仍能影响该实例
         $overrides = $config;
@@ -252,6 +267,8 @@ class RequestCache
 
             if (isset($requestCacheConfig['force_validate'])) {
                 $this->forceValidate = $requestCacheConfig['force_validate'];
+            } else {
+                $this->forceValidate = false;
             }
 
             if (isset($requestCacheConfig['enable_stats'])) {
@@ -278,6 +295,18 @@ class RequestCache
         $this->clusterNodeResolver = new RedisClusterNodeResolver($this->cacheConfig->redisCluster());
     }
 
+    /**
+     * 克隆时隔离 LocalCache 与标签状态，避免 cluster() 克隆共享进程内缓存
+     */
+    public function __clone()
+    {
+        $this->localCache = new LocalCache($this->cacheConfig->localCache());
+        $this->clusterNodeResolver = new RedisClusterNodeResolver(
+            $this->cacheConfig->redisCluster(),
+            $this->connectionName
+        );
+        $this->tags = [];
+    }
     /**
      * 获取当前实例生效的缓存配置
      * @return CacheConfig
@@ -394,6 +423,14 @@ class RequestCache
     }
 
     /**
+     * 获取 Redis 客户端适配器
+     * @return RedisClientAdapter
+     */
+    protected function adaptedConnection(): RedisClientAdapter
+    {
+        return RedisClientAdapter::wrap($this->connection());
+    }
+    /**
      * 获取默认连接：统计计数固定读写该连接，与锁跟随目标集群的语义故意不同
      * @return mixed
      */
@@ -426,7 +463,7 @@ class RequestCache
 
         try {
             $redisConfig = config('database.redis', []);
-        } catch (\Exception $e) {
+        } catch (\Throwable $e) {
             $redisConfig = [];
         }
         $redisConfig = is_array($redisConfig) ? $redisConfig : [];
@@ -574,10 +611,25 @@ class RequestCache
         if ($this->encryptData && function_exists('decrypt')) {
             try {
                 $value = decrypt($value);
-            } catch (\Exception $e) {
+            } catch (\Throwable $e) {
                 //解密失败，使用原始值
                 $value = $originalValue;
             }
+        }
+
+        if (is_string($value) && str_starts_with($value, 's:')) {
+            $payload = @unserialize(substr($value, 2));
+            if (is_array($payload)
+                && ($payload['v'] ?? null) === self::ENVELOPE_VERSION
+                && array_key_exists('d', $payload)
+            ) {
+                return [
+                    'data' => $payload['d'],
+                    'expires_at' => isset($payload['e']) ? (int) $payload['e'] : null,
+                ];
+            }
+
+            return null;
         }
 
         $decoded = json_decode($value, true);
@@ -614,13 +666,32 @@ class RequestCache
         }
 
         $jsonData = json_encode($envelope);
-        if ($jsonData === false || strlen($jsonData) > $this->sizeLimit) {
+        if ($jsonData === false) {
+            $payload = 's:' . serialize($envelope);
+            CacheLogger::warning('json_encode failed for cache value, using serialize envelope');
+            if (strlen($payload) > $this->sizeLimit) {
+                CacheLogger::warning('serialized cache value exceeds size limit', [
+                    'size' => strlen($payload),
+                    'limit' => $this->sizeLimit,
+                ]);
+                return false;
+            }
+            $jsonData = $payload;
+        } elseif (strlen($jsonData) > $this->sizeLimit) {
+            CacheLogger::warning('cache value exceeds size limit', [
+                'size' => strlen($jsonData),
+                'limit' => $this->sizeLimit,
+            ]);
             return false;
         }
 
         if ($this->encryptData && function_exists('encrypt')) {
             $jsonData = encrypt($jsonData);
             if (strlen($jsonData) > $this->sizeLimit) {
+                CacheLogger::warning('encrypted cache value exceeds size limit', [
+                    'size' => strlen($jsonData),
+                    'limit' => $this->sizeLimit,
+                ]);
                 return false;
             }
         }
@@ -826,7 +897,7 @@ class RequestCache
         //Laravel 环境配置
         try {
             $hashKey = config('app.key', 'default_cache_key') ?: 'default_cache_key';
-        } catch (\Exception $e) {
+        } catch (\Throwable $e) {
             //Laravel config function fails, use default
             $hashKey = 'default_cache_key';
         }
@@ -886,7 +957,7 @@ class RequestCache
 
                     return $entry;
                 }
-            } catch (\Exception $e) {
+            } catch (\Throwable $e) {
                 //Redis 异常，本地缓存兜底已在上面处理
             }
         }
@@ -916,7 +987,7 @@ class RequestCache
                 $result[$index] = $this->localCache->get($localKey);
             } else {
                 $keysToGet[] = $key;
-                $keyMap[$key] = $index;
+                $keyMap[$key][] = $index;
             }
         }
 
@@ -946,10 +1017,12 @@ class RequestCache
 
                     //添加到结果
                     if (isset($keyMap[$key])) {
-                        $result[$keyMap[$key]] = $entry['data'];
+                        foreach ($keyMap[$key] as $idx) {
+                            $result[$idx] = $entry['data'];
+                        }
                     }
                 }
-            } catch (\Exception $e) {
+            } catch (\Throwable $e) {
                 if (!$this->isCrossSlotException($e)) {
                     return $result;
                 }
@@ -968,9 +1041,11 @@ class RequestCache
 
                         $this->localCache->set($this->localCacheKey($key), $entry['data'], $this->localCacheTtl($entry['expires_at']));
                         if (isset($keyMap[$key])) {
-                            $result[$keyMap[$key]] = $entry['data'];
+                            foreach ($keyMap[$key] as $idx) {
+                                $result[$idx] = $entry['data'];
+                            }
                         }
-                    } catch (\Exception $ignored) {
+                    } catch (\Throwable $ignored) {
                         //忽略单 key 读取异常
                     }
                 }
@@ -1013,8 +1088,11 @@ class RequestCache
             $this->localCache->set($this->localCacheKey($key), $data, $expire);
 
             return $result;
-        } catch (\Exception $e) {
+        } catch (\Throwable $e) {
             //Redis 异常时，尝试使用本地缓存作为回退
+            CacheLogger::warning('Redis set failed, falling back to local cache', [
+                'error' => $e->getMessage(),
+            ]);
             $key = $this->generateKey($gateway, $params);
             $expire = $expire ?? $this->defaultExpire * 60;
 
@@ -1059,9 +1137,22 @@ class RequestCache
     {
         $now = time();
 
+        // 部分客户端对 WRONGTYPE 只返回 false 不抛异常；先看类型再决定是否重建
+        $type = null;
+        try {
+            $type = $redis->type($tagKey);
+        } catch (\Throwable $e) {
+            $type = null;
+        }
+
+        $isSet = $type === 2 || $type === 'set' || $type === 'SET';
+        if ($isSet) {
+            $redis->del($tagKey);
+        }
+
         try {
             $redis->zadd($tagKey, $now + $expire, $cacheKey);
-        } catch (\Exception $e) {
+        } catch (\Throwable $e) {
             if (!$this->isWrongTypeException($e)) {
                 throw $e;
             }
@@ -1072,8 +1163,18 @@ class RequestCache
         }
 
         //剔除已过期成员，索引大小跟随存活条目而不是历史写入总量
-        $redis->zremrangebyscore($tagKey, '-inf', (string) $now);
-        $redis->expire($tagKey, $expire + 3600);
+        try {
+            $redis->zremrangebyscore($tagKey, '-inf', (string) $now);
+            $redis->expire($tagKey, $expire + 3600);
+        } catch (\Throwable $e) {
+            if ($this->isWrongTypeException($e)) {
+                $redis->del($tagKey);
+                $redis->zadd($tagKey, $now + $expire, $cacheKey);
+                $redis->expire($tagKey, $expire + 3600);
+            } else {
+                throw $e;
+            }
+        }
     }
 
     /**
@@ -1086,7 +1187,7 @@ class RequestCache
     {
         try {
             $members = $redis->zrange($tagKey, 0, -1);
-        } catch (\Exception $e) {
+        } catch (\Throwable $e) {
             if (!$this->isWrongTypeException($e)) {
                 throw $e;
             }
@@ -1117,16 +1218,16 @@ class RequestCache
     {
         $results = [];
         $pipeline = null;
+        $pipelineWrites = [];
         $localWrites = [];
         $strategy = $this->cacheConfig->strategy();
         $tags = $this->consumeTags();
 
         try {
-            //如果使用 Redis 作为主缓存，使用管道批量操作
+            $redis = null;
             if ($strategy['primary'] === 'redis' && !$this->isClusterSafeMode()) {
-                //使用 Laravel Redis 连接
                 $redis = $this->connection();
-                $pipeline = $redis->pipeline();
+                $pipeline = RedisClientAdapter::wrap($redis)->pipelineOrNull();
             }
 
             foreach ($items as $index => $item) {
@@ -1142,14 +1243,9 @@ class RequestCache
                     continue;
                 }
 
-                //使用管道批量操作
                 if ($pipeline) {
                     $pipeline->setex($key, $expire, $jsonData);
-
-                    //保存标签关联
-                    foreach ($tags as $tag) {
-                        $this->touchTagIndex($pipeline, $this->buildTagKey($tag), $key, $expire);
-                    }
+                    $pipelineWrites[] = [$key, $expire, $tags];
                     $localWrites[$index] = [$key, $data, $expire];
                     $results[$index] = true;
                     continue;
@@ -1159,16 +1255,22 @@ class RequestCache
                 $results[$index] = $this->set($gateway, $params, $data, $expire);
             }
 
-            //执行管道操作
             if ($pipeline) {
                 $pipeline->exec();
+                foreach ($pipelineWrites as [$key, $expire, $itemTags]) {
+                    foreach ($itemTags as $tag) {
+                        $this->touchTagIndex($redis, $this->buildTagKey($tag), $key, $expire);
+                    }
+                }
                 foreach ($localWrites as [$key, $data, $expire]) {
                     $this->localCache->set($this->localCacheKey($key), $data, $expire);
                 }
             }
-        } catch (\Exception $e) {
+        } catch (\Throwable $e) {
             if (!$this->isCrossSlotException($e)) {
-                //Redis 异常时，尝试使用本地缓存作为回退
+                CacheLogger::warning('Redis mset failed, falling back to local cache', [
+                    'error' => $e->getMessage(),
+                ]);
                 foreach ($items as $index => $item) {
                     if (array_key_exists($index, $results) && $results[$index] === false) {
                         continue;
@@ -1192,7 +1294,6 @@ class RequestCache
                 return $results;
             }
 
-            //Redis Cluster 跨 slot 时降级为逐 key 写入
             foreach ($items as $index => $item) {
                 $expire = isset($item[3]) ? $item[3] : null;
                 $this->tags = $tags;
@@ -1218,7 +1319,7 @@ class RequestCache
             //使用 Laravel Redis 连接
             $redis = $this->connection();
             return $redis->del($key) > 0;
-        } catch (\Exception $e) {
+        } catch (\Throwable $e) {
             return false;
         }
     }
@@ -1231,7 +1332,7 @@ class RequestCache
     {
         try {
             return config('database.redis.options.prefix', '');
-        } catch (\Exception $e) {
+        } catch (\Throwable $e) {
             return '';
         }
     }
@@ -1289,7 +1390,7 @@ class RequestCache
                 }
                 //每批删除后短暂休眠，减少 Redis 压力
                 usleep(10000); // 10ms
-            } catch (\Exception $e) {
+            } catch (\Throwable $e) {
                 if (!$this->isCrossSlotException($e)) {
                     continue;
                 }
@@ -1300,7 +1401,7 @@ class RequestCache
                             ? preg_replace('/^' . preg_quote($redisPrefix, '/') . '/', '', $key)
                             : $key;
                         $deleted += $redis->del($keyWithoutPrefix);
-                    } catch (\Exception $ignored) {
+                    } catch (\Throwable $ignored) {
                         //忽略单 key 删除异常
                     }
                 }
@@ -1385,7 +1486,7 @@ class RequestCache
             if (!empty($buffer)) {
                 $deleted += $this->batchDeleteOnConnection($redis, $buffer, $batchSize);
             }
-        } catch (\Exception $e) {
+        } catch (\Throwable $e) {
             //某个节点失败时保留已删除计数，由调用方按整体结果判断
         }
 
@@ -1416,7 +1517,7 @@ class RequestCache
                 $pattern = $this->prefix . $this->version . ':' . $sanitizedGateway . ':*';
             }
             return $this->clearByPattern($pattern);
-        } catch (\Exception $e) {
+        } catch (\Throwable $e) {
             return false;
         }
     }
@@ -1430,20 +1531,21 @@ class RequestCache
     {
         try {
             $tags = is_array($tags) ? $tags : func_get_args();
-            $keys = [];
+            $keys = null;
 
             //使用 Laravel Redis 连接
             $redis = $this->connection();
 
             foreach ($tags as $tag) {
                 $tagKey = $this->buildTagKey($tag);
-                $keys = array_merge($keys, $this->readTagIndex($redis, $tagKey));
+                $members = $this->readTagIndex($redis, $tagKey);
+                $keys = $keys === null ? $members : array_values(array_intersect($keys, $members));
                 //删除标签索引
                 $redis->del($tagKey);
             }
 
             if (!empty($keys)) {
-                $this->batchDelete(array_unique($keys));
+                $this->batchDelete($keys);
             }
 
             $this->localCache->flush();
@@ -1451,7 +1553,7 @@ class RequestCache
             //删除条数不作为成功判据：索引里的 key 可能已经自然过期，DEL 返回 0
             //并不代表清理失败。只有 Redis 异常才算失败，走下面的 catch。
             return true;
-        } catch (\Exception $e) {
+        } catch (\Throwable $e) {
             return false;
         }
     }
@@ -1472,7 +1574,7 @@ class RequestCache
                 $pattern = $this->prefix . $this->version . ':*';
             }
             return $this->clearByPattern($pattern);
-        } catch (\Exception $e) {
+        } catch (\Throwable $e) {
             return false;
         }
     }
@@ -1503,7 +1605,7 @@ class RequestCache
             //设置过期时间：全局统计 30 天，每日统计 90 天
             $redis->expire($globalKey, $statsConfig['globalExpire'] ?? 30 * 24 * 3600);
             $redis->expire($dailyKey, $statsConfig['dailyExpire'] ?? 90 * 24 * 3600);
-        } catch (\Exception $e) {
+        } catch (\Throwable $e) {
             //忽略统计异常
         }
     }
@@ -1540,9 +1642,13 @@ class RequestCache
                 $currentDelay = min($currentDelay, 1000000);
                 usleep($currentDelay);
             }
-        } catch (\Exception $e) {
-            //Redis 异常时，返回 null 表示获取锁失败
+        } catch (\Throwable $e) {
+            CacheLogger::warning('acquireLock failed due to Redis error', [
+                'error' => $e->getMessage(),
+            ]);
         }
+
+        CacheLogger::warning('acquireLock exhausted retries', ['key' => $key]);
 
         return null;
     }
@@ -1578,7 +1684,7 @@ class RequestCache
                 if (!$this->connection()->exists($lockKey)) {
                     return null;
                 }
-            } catch (\Exception $e) {
+            } catch (\Throwable $e) {
                 return null;
             }
         }
@@ -1611,9 +1717,18 @@ class RequestCache
             $redis = $this->connection();
 
             //直接执行 eval 命令
-            return $redis->eval($script, 1, $lockKey, $lockValue, $expire) > 0;
-        } catch (\Exception $e) {
-            //Redis 异常时，返回 false 表示续期失败
+            $renewed = $redis->eval($script, 1, $lockKey, $lockValue, $expire) > 0;
+            if (!$renewed) {
+                CacheLogger::warning('renewLock failed', ['key' => $key]);
+            }
+
+            return $renewed;
+        } catch (\Throwable $e) {
+            CacheLogger::warning('renewLock Redis error', [
+                'key' => $key,
+                'error' => $e->getMessage(),
+            ]);
+
             return false;
         }
     }
@@ -1643,12 +1758,38 @@ class RequestCache
 
             //直接执行 eval 命令
             return $redis->eval($script, 1, $lockKey, $lockValue) > 0;
-        } catch (\Exception $e) {
+        } catch (\Throwable $e) {
             //Redis 异常时，返回 false 表示释放锁失败
             return false;
         }
     }
 
+
+    /**
+     * 持锁期间续期：回调前后各 renew 一次；remember() 在 enable_extend 时会拉长持锁 TTL
+     * @param callable $callback
+     * @param string $key
+     * @param string $lockValue
+     * @return mixed
+     */
+    protected function invokeWithLockRenewal(callable $callback, string $key, string $lockValue)
+    {
+        $lockConfig = $this->cacheConfig->lock();
+        $enable = !empty($lockConfig['enableExtend'] ?? $lockConfig['enable_extend'] ?? true);
+        $expire = (int) ($lockConfig['expire'] ?? 10);
+
+        if (!$enable) {
+            return $callback();
+        }
+
+        // 无异步心跳：回调前后各续期一次；持锁 TTL 在 remember() 里已按需拉长
+        $this->renewLock($key, $lockValue, $expire);
+        try {
+            return $callback();
+        } finally {
+            $this->renewLock($key, $lockValue, $expire);
+        }
+    }
     /**
      * 缓存装饰器
      * @param string $gateway
@@ -1677,7 +1818,14 @@ class RequestCache
 
         //获取锁，防止缓存击穿
         $key = $this->generateKey($gateway, $params);
-        $lockValue = $this->acquireLock($key);
+        $lockConfig = $this->cacheConfig->lock();
+        $lockExpire = (int) ($lockConfig['expire'] ?? 10);
+        if (!empty($lockConfig['enableExtend'] ?? $lockConfig['enable_extend'] ?? true)) {
+            // 同步 PHP 无法在回调中途可靠心跳：拉长持锁 TTL，再配合回调前后 renewLock
+            $extendInterval = max(1, (int) ($lockConfig['extendInterval'] ?? $lockConfig['extend_interval'] ?? 2));
+            $lockExpire = max($lockExpire, $lockExpire + $extendInterval * 5);
+        }
+        $lockValue = $this->acquireLock($key, $lockExpire);
 
         if ($lockValue) {
             try {
@@ -1688,7 +1836,7 @@ class RequestCache
                 }
 
                 //执行回调获取数据
-                $data = $callback();
+                $data = $this->invokeWithLockRenewal($callback, $key, $lockValue);
 
                 //存入缓存
                 $this->tags = $tags;
@@ -1733,7 +1881,7 @@ class RequestCache
                 : 0;
 
             return $stats;
-        } catch (\Exception $e) {
+        } catch (\Throwable $e) {
             return [
                 'hits' => 0,
                 'misses' => 0,
@@ -1788,7 +1936,7 @@ class RequestCache
         try {
             $searchService = $this->searchService();
             return $searchService->index($id, $document);
-        } catch (\Exception $e) {
+        } catch (\Throwable $e) {
             return false;
         }
     }
@@ -1804,7 +1952,7 @@ class RequestCache
         try {
             $searchService = $this->searchService();
             return $searchService->search($query, $options);
-        } catch (\Exception $e) {
+        } catch (\Throwable $e) {
             return [];
         }
     }
@@ -1819,7 +1967,7 @@ class RequestCache
         try {
             $searchService = $this->searchService();
             return $searchService->delete($id);
-        } catch (\Exception $e) {
+        } catch (\Throwable $e) {
             return false;
         }
     }
@@ -1833,7 +1981,7 @@ class RequestCache
         try {
             $searchService = $this->searchService();
             return $searchService->clear();
-        } catch (\Exception $e) {
+        } catch (\Throwable $e) {
             return false;
         }
     }
@@ -1849,7 +1997,7 @@ class RequestCache
         try {
             $searchService = $this->searchService();
             return $searchService->advancedSearch($conditions, $options);
-        } catch (\Exception $e) {
+        } catch (\Throwable $e) {
             return [];
         }
     }
@@ -1864,7 +2012,7 @@ class RequestCache
         try {
             $searchService = $this->searchService();
             return $searchService->bulkIndex($documents);
-        } catch (\Exception $e) {
+        } catch (\Throwable $e) {
             return false;
         }
     }
@@ -1879,7 +2027,7 @@ class RequestCache
         try {
             $searchService = $this->searchService();
             return $searchService->bulkDelete($ids);
-        } catch (\Exception $e) {
+        } catch (\Throwable $e) {
             return false;
         }
     }
@@ -1893,7 +2041,7 @@ class RequestCache
         try {
             $searchService = $this->searchService();
             return $searchService->countDocuments();
-        } catch (\Exception $e) {
+        } catch (\Throwable $e) {
             return 0;
         }
     }
@@ -1907,7 +2055,7 @@ class RequestCache
         try {
             $searchService = $this->searchService();
             return $searchService->existIndex();
-        } catch (\Exception $e) {
+        } catch (\Throwable $e) {
             return false;
         }
     }
@@ -1921,7 +2069,7 @@ class RequestCache
         try {
             $searchService = $this->searchService();
             return $searchService->rebuildIndex();
-        } catch (\Exception $e) {
+        } catch (\Throwable $e) {
             return false;
         }
     }

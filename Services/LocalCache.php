@@ -31,13 +31,35 @@ class LocalCache
     }
     
     /**
+     * 检查单个 key 是否已过期
+     * @param string $key
+     * @return bool
+     */
+    protected function isExpired(string $key): bool
+    {
+        if (!isset($this->expires[$key])) {
+            return false;
+        }
+
+        if (time() > $this->expires[$key]) {
+            unset($this->cache[$key], $this->expires[$key]);
+
+            return true;
+        }
+
+        return false;
+    }
+
+    /**
      * 获取缓存
      * @param string $key
      * @return mixed
      */
     public function get(string $key)
     {
-        $this->cleanExpired();
+        if ($this->isExpired($key)) {
+            return null;
+        }
         
         if (array_key_exists($key, $this->cache)) {
             return $this->cache[$key];
@@ -57,7 +79,9 @@ class LocalCache
      */
     public function has(string $key): bool
     {
-        $this->cleanExpired();
+        if ($this->isExpired($key)) {
+            return false;
+        }
 
         return array_key_exists($key, $this->cache);
     }
@@ -71,8 +95,6 @@ class LocalCache
      */
     public function set(string $key, $value, int $expire = null)
     {
-        $this->cleanExpired();
-        
         //检查缓存大小
         if (count($this->cache) >= $this->config['size']) {
             $this->evictOldest();
@@ -134,12 +156,26 @@ class LocalCache
         if (empty($this->expires)) {
             return;
         }
-        
-        asort($this->expires);
-        $oldestKey = key($this->expires);
-        
-        unset($this->cache[$oldestKey]);
-        unset($this->expires[$oldestKey]);
+
+        $now = time();
+        $oldestKey = null;
+        $oldestExpire = PHP_INT_MAX;
+
+        foreach ($this->expires as $key => $expire) {
+            if ($now > $expire) {
+                unset($this->cache[$key], $this->expires[$key]);
+                continue;
+            }
+
+            if ($expire < $oldestExpire) {
+                $oldestExpire = $expire;
+                $oldestKey = $key;
+            }
+        }
+
+        if ($oldestKey !== null) {
+            unset($this->cache[$oldestKey], $this->expires[$oldestKey]);
+        }
     }
     
     /**
