@@ -535,6 +535,7 @@ $cache = new RequestCache([
         'prefix' => 'my_app_',
         'default_expire' => 5,
         'enable_stats' => true,
+        'enable_logging' => false, //默认关闭包内诊断日志；排查时可临时打开
         'encrypt_data' => true,
     ],
 ]);
@@ -733,6 +734,7 @@ php vendor\phpunit\phpunit\phpunit tests\RequestCacheClusterTest.php --filter "C
 - 缓存值编码支持非 UTF-8 的 serialize 信封兜底；`force_validate` 默认改为 `false`。
 - `clearTags([...])` 多标签改为真正交集；`remember()` 持锁 TTL 拉长并在回调前后续期。
 - `all_nodes` 节点连接继承 `database.redis.clusters.options` 凭据；`cluster()` 克隆隔离 `LocalCache`。
+- `request_cache.enable_logging` 默认 `false`，关闭包内 `[request-cache]` 诊断日志。
 - 构造时只传 `cache` 段会从应用配置补齐 `request_cache` 段，避免 version 等静默丢失。
 
 ### v1.0.5

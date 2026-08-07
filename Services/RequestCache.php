@@ -134,6 +134,10 @@ class RequestCache
 
         //加载 CacheConfig 配置
         CacheConfig::loadFromConfig($config);
+
+        if (isset($config['request_cache']['enable_logging'])) {
+            CacheLogger::setEnabled((bool) $config['request_cache']['enable_logging']);
+        }
     }
 
     /**
@@ -275,6 +279,10 @@ class RequestCache
                 $this->enableStats = $requestCacheConfig['enable_stats'];
             } else {
                 $this->enableStats = !empty($this->cacheConfig->stats()['enabled']);
+            }
+
+            if (isset($requestCacheConfig['enable_logging'])) {
+                CacheLogger::setEnabled((bool) $requestCacheConfig['enable_logging']);
             }
 
             if (isset($requestCacheConfig['encrypt_data'])) {
@@ -618,7 +626,7 @@ class RequestCache
         }
 
         if (is_string($value) && str_starts_with($value, 's:')) {
-            $payload = @unserialize(substr($value, 2));
+            $payload = @unserialize(substr($value, 2), ['allowed_classes' => false]);
             if (is_array($payload)
                 && ($payload['v'] ?? null) === self::ENVELOPE_VERSION
                 && array_key_exists('d', $payload)
@@ -1531,21 +1539,36 @@ class RequestCache
     {
         try {
             $tags = is_array($tags) ? $tags : func_get_args();
-            $keys = null;
+            if ($tags === []) {
+                $this->localCache->flush();
+
+                return true;
+            }
 
             //使用 Laravel Redis 连接
             $redis = $this->connection();
+            $tagKeys = [];
+            $keys = null;
 
             foreach ($tags as $tag) {
                 $tagKey = $this->buildTagKey($tag);
+                $tagKeys[] = $tagKey;
                 $members = $this->readTagIndex($redis, $tagKey);
                 $keys = $keys === null ? $members : array_values(array_intersect($keys, $members));
-                //删除标签索引
-                $redis->del($tagKey);
             }
 
             if (!empty($keys)) {
                 $this->batchDelete($keys);
+            }
+
+            if (count($tagKeys) === 1) {
+                //单标签：整张索引一起清掉
+                $redis->del($tagKeys[0]);
+            } else {
+                //多标签取交集：只从各索引摘掉被删成员，保留只挂在单个标签上的 key
+                foreach ($tagKeys as $tagKey) {
+                    $this->detachKeysFromTagIndex($redis, $tagKey, $keys ?? []);
+                }
             }
 
             $this->localCache->flush();
@@ -1554,7 +1577,32 @@ class RequestCache
             //并不代表清理失败。只有 Redis 异常才算失败，走下面的 catch。
             return true;
         } catch (\Throwable $e) {
+            CacheLogger::warning('clearTags failed', ['error' => $e->getMessage()]);
+
             return false;
+        }
+    }
+
+    /**
+     * 从标签索引中移除指定缓存 key（兼容 ZSET 与遗留 SET）
+     * @param mixed $redis
+     * @param string $tagKey
+     * @param array $cacheKeys
+     */
+    protected function detachKeysFromTagIndex($redis, string $tagKey, array $cacheKeys): void
+    {
+        if ($cacheKeys === []) {
+            return;
+        }
+
+        try {
+            $redis->zrem($tagKey, ...array_values($cacheKeys));
+        } catch (\Throwable $e) {
+            if (!$this->isWrongTypeException($e)) {
+                throw $e;
+            }
+
+            $redis->srem($tagKey, ...array_values($cacheKeys));
         }
     }
 
@@ -1772,17 +1820,18 @@ class RequestCache
      * @param string $lockValue
      * @return mixed
      */
-    protected function invokeWithLockRenewal(callable $callback, string $key, string $lockValue)
+    protected function invokeWithLockRenewal(callable $callback, string $key, string $lockValue, int $expire = null)
     {
         $lockConfig = $this->cacheConfig->lock();
         $enable = !empty($lockConfig['enableExtend'] ?? $lockConfig['enable_extend'] ?? true);
-        $expire = (int) ($lockConfig['expire'] ?? 10);
+        //必须使用 remember() 算好的拉长 TTL；若这里写回短 expire，拉长会立刻被打回
+        $expire = $expire ?? (int) ($lockConfig['expire'] ?? 10);
 
         if (!$enable) {
             return $callback();
         }
 
-        // 无异步心跳：回调前后各续期一次；持锁 TTL 在 remember() 里已按需拉长
+        // 无异步心跳：回调前后各续期一次，续期时长与持锁 TTL 一致
         $this->renewLock($key, $lockValue, $expire);
         try {
             return $callback();
@@ -1836,7 +1885,7 @@ class RequestCache
                 }
 
                 //执行回调获取数据
-                $data = $this->invokeWithLockRenewal($callback, $key, $lockValue);
+                $data = $this->invokeWithLockRenewal($callback, $key, $lockValue, $lockExpire);
 
                 //存入缓存
                 $this->tags = $tags;

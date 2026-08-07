@@ -3,11 +3,45 @@
 namespace HwlowellRequestCache;
 
 /**
- * 薄日志封装：有 Laravel Log facade 就写，否则静默。
- * 关键路径必须可观测，避免 Redis 降级/编码失败在生产环境无声失效。
+ * 薄日志封装：默认关闭；开启后有 Laravel Log facade 才写。
  */
 class CacheLogger
 {
+    /**
+     * null 表示跟随配置文件；显式 true/false 覆盖配置
+     * @var bool|null
+     */
+    protected static $enabled = null;
+
+    /**
+     * 设置是否输出日志；传 null 恢复为读取配置
+     * @param bool|null $enabled
+     */
+    public static function setEnabled(?bool $enabled): void
+    {
+        self::$enabled = $enabled;
+    }
+
+    /**
+     * 当前是否允许写日志
+     */
+    public static function isEnabled(): bool
+    {
+        if (self::$enabled !== null) {
+            return self::$enabled;
+        }
+
+        try {
+            if (function_exists('config')) {
+                return (bool) config('request_cache.request_cache.enable_logging', false);
+            }
+        } catch (\Throwable $e) {
+            //忽略
+        }
+
+        return false;
+    }
+
     /**
      * @param string $message
      * @param array $context
@@ -33,6 +67,10 @@ class CacheLogger
      */
     protected static function write(string $level, string $message, array $context): void
     {
+        if (!self::isEnabled()) {
+            return;
+        }
+
         try {
             if (!class_exists(\Illuminate\Support\Facades\Log::class)) {
                 return;

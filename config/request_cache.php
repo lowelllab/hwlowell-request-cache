@@ -23,6 +23,9 @@ return [
         //启用缓存统计
         'enable_stats' => false,
 
+        //启用包内诊断日志（默认关闭，避免生产刷屏；排查降级/编码失败时可临时打开）
+        'enable_logging' => false,
+
         //加密缓存数据
         'encrypt_data' => false,
 
