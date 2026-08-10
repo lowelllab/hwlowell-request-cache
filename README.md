@@ -2,6 +2,8 @@
 
 RequestCache 是一个面向 Laravel 应用的请求级缓存包，支持 Redis 主缓存、本地进程缓存、缓存标签、统计监控、Redis Cluster 兼容和严格共享部署模式。
 
+部署形态配置、场景示例、升级检查与注意事项见 [docs/v1.1.0-使用规范与注意事项.md](./docs/v1.1.0-使用规范与注意事项.md)。
+
 ## 功能特性
 
 - 基于 Redis 的请求缓存，并支持本地进程缓存兜底。
@@ -736,6 +738,7 @@ php vendor\phpunit\phpunit\phpunit tests\RequestCacheClusterTest.php --filter "C
 - `all_nodes` 节点连接继承 `database.redis.clusters.options` 凭据；`cluster()` 克隆隔离 `LocalCache`。
 - `request_cache.enable_logging` 默认 `false`，关闭包内 `[request-cache]` 诊断日志。
 - 构造时只传 `cache` 段会从应用配置补齐 `request_cache` 段，避免 version 等静默丢失。
+- 使用规范、形态配置与升级说明合并为 [docs/v1.1.0-使用规范与注意事项.md](./docs/v1.1.0-使用规范与注意事项.md)。
 
 ### v1.0.5
 
