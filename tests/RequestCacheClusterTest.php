@@ -1369,6 +1369,34 @@ class RequestCacheClusterTest extends TestCase
         $this->assertSame([0 => true], $result);
     }
 
+    public function testMsetKeepsResultOrderWhenAnItemFailsBeforeThePipeline()
+    {
+        $config = $this->clusterConfig([
+            'hash_tag' => 'request-cache',
+            'cluster_safe_mode' => false,
+        ]);
+        //第二条超出 size_limit，会在编码阶段就失败，早于管道 exec() 回填结果
+        $config['request_cache']['size_limit'] = 512;
+
+        $cache = new RequestCache($config);
+        $pipeline = $this->redisFake([
+            'setex' => true,
+            'exec' => [true],
+        ]);
+        $redis = $this->redisFake(['pipeline' => $pipeline]);
+        Redis::shouldReceive('connection')->atLeast()->once()->andReturn($redis);
+
+        $result = $cache->mset([
+            ['users', ['id' => 1], ['name' => 'Ada'], 60],
+            ['users', ['id' => 2], ['name' => str_repeat('x', 4096)], 60],
+        ]);
+
+        //下标必须跟着入参顺序：调用方常用 array_values() / === / array_combine()
+        //消费这个返回值，顺序错位会让结果与条目静默对不上
+        $this->assertSame([0 => true, 1 => false], $result);
+        $this->assertSame([true, false], array_values($result));
+    }
+
     public function testSetReportsFailureAndSkipsSideEffectsWhenRedisRejectsTheWrite()
     {
         $cache = new RequestCache($this->clusterConfig([

@@ -736,7 +736,7 @@ php vendor\phpunit\phpunit\phpunit tests\RequestCacheClusterTest.php --filter "C
 
 - **本地缓存副本不再超过 `local_cache.ttl`。** 此前写入路径直接沿用 Redis 的 TTL，`set(..., 3600)` 会让常驻进程（Octane、队列 worker）在别的实例改写 Redis 之后，仍按 3600 秒返回旧值。现在 `set()`、`mset()` 与两者的本地兜底写入都与读取路径共用同一个上限。
 - **集群模式下不再丢弃显式配置的 `prefix`。** 此前 `redis_cluster.enabled=true` 时 `resolvePrefix()` 直接返回 `{hash_tag}:`，把 `request_cache.prefix` 整个丢掉；共用一个集群、又都按文档配了同一个 `hash_tag` 的多个应用会得到完全相同的 key 前缀，任意一方 `clearAll()` 都会连带删光另一方的缓存。现在显式 prefix 会保留在 hash tag 之后，形如 `{request-cache}:my_app_`。
-- **`mset()` 管道路径按 `exec()` 的逐条响应返回结果。** 此前入队即记 `true` 且从不检查 `exec()` 返回值，管道内单条写入失败时调用方仍拿到 `true`；失败项现在返回 `false` 且不写入本地副本。客户端不返回逐条响应（非数组）时仍按成功处理。
+- **`mset()` 管道路径按 `exec()` 的逐条响应返回结果。** 此前入队即记 `true` 且从不检查 `exec()` 返回值，管道内单条写入失败时调用方仍拿到 `true`；失败项现在返回 `false` 且不写入本地副本。客户端不返回逐条响应（非数组）时仍按成功处理。返回数组的下标顺序保证与入参一致——管道结果要等 `exec()` 之后才回填，而超出 `size_limit` 或非 UTF-8 的条目在那之前就已失败，两者混在一批里时不重排会让 `array_values()`、`===` 比较或 `array_combine($ids, $results)` 这类用法静默错位。
 - **`set()` 同样不再忽略 `setex` 返回的 `false`。** Redis 拒绝写入（OOM、只读副本）时不抛异常，只返回 `false`，此前会在返回失败的同时照常写入标签索引和本地副本——`shared_mode=true` 的调用方拿到 `false` 却仍能从本进程读到这条数据。
 - **`remember()` 的等待窗口与持锁者实际 TTL 对齐。** `enable_extend` 会把持锁 TTL 从 `lock.expire` 拉长到 `expire + extend_interval * 5`（默认 5→15 秒），而 `waitForCachedEntry()` 一直按未拉长的 `lock.expire` 超时，导致耗时落在 5～15 秒的回调仍会击穿。**副作用：抢锁失败的调用方最长阻塞时间从 `lock.expire` 变为拉长后的 TTL**（持锁者提前释放时会立刻结束等待）；不接受这个延迟就调小 `lock.expire` / `extend_interval`，或关掉 `enable_extend`。
 - **`remember()` 在等待超时后回源的结果现在会写入缓存。** 此前直接返回不落缓存，持续竞争下每个等待超时者都重复回源且谁都不填坑。

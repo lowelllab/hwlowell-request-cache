@@ -1364,7 +1364,7 @@ class RequestCache
                     $this->localCache->set($this->localCacheKey($key), $data, $this->localWriteTtl($expire));
                     $results[$index] = true;
                 }
-                return $results;
+                return $this->orderResultsByInput($results, $items);
             }
 
             foreach ($items as $index => $item) {
@@ -1374,7 +1374,39 @@ class RequestCache
             }
         }
 
-        return $results;
+        return $this->orderResultsByInput($results, $items);
+    }
+
+    /**
+     * 把 mset() 的结果按入参顺序排列
+     *
+     * 管道路径的结果要等 exec() 之后才能回填，而编码阶段就失败的条目（超出
+     * size_limit、非 UTF-8）在那之前就已写进数组，两者混在一批里会让返回值的
+     * 下标顺序与入参不符。下标本身是对的，但 array_values()、=== 比较或
+     * array_combine($ids, $results) 这类用法会因此静默错位。
+     *
+     * @param array $results
+     * @param array $items mset() 的原始入参，其键顺序即期望顺序
+     * @return array
+     */
+    protected function orderResultsByInput(array $results, array $items): array
+    {
+        $ordered = [];
+
+        foreach (array_keys($items) as $index) {
+            if (array_key_exists($index, $results)) {
+                $ordered[$index] = $results[$index];
+            }
+        }
+
+        //入参之外的下标理论上不存在，真出现了也不能丢
+        foreach ($results as $index => $result) {
+            if (!array_key_exists($index, $ordered)) {
+                $ordered[$index] = $result;
+            }
+        }
+
+        return $ordered;
     }
 
     /**
