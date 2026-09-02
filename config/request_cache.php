@@ -69,8 +69,7 @@ return [
         //缓存策略
         'strategy' => [
             'primary' => 'redis', //主缓存
-            'secondary' => 'array', //备用缓存
-            'fallback' => true, //启用降级
+            'fallback' => true, //启用降级，Redis 失败时回落进程内 LocalCache
             'shared_mode' => false, //共享模式：Redis 写失败时禁止写入本地缓存并返回成功
         ],
 
@@ -106,6 +105,13 @@ return [
             'connections' => [], //允许手动切换的连接白名单，留空表示按 database.redis 自动推导
         ],
     ],
+    /*
+    |--------------------------------------------------------------------------
+    | RediSearch 索引名（本包不消费）
+    |--------------------------------------------------------------------------
+    | RediSearchService 已不随包提供，检索能力请改用 cmsig/seal 系列扩展。
+    | 此项仅保留给宿主项目自行读取，包内不会使用它。
+    */
     'redis_search' => [
         'index_name' => (function_exists('env') ? env('APP_ENV', 'local') : (getenv('APP_ENV') ?: 'local')).'_request_cache', //索引名称前缀
     ],

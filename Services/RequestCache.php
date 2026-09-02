@@ -4,7 +4,6 @@ namespace HwlowellRequestCache;
 
 use Illuminate\Redis\Connections\PhpRedisConnection;
 use Illuminate\Support\Facades\Redis;
-use Illuminate\Http\Request;
 use Illuminate\Support\Str;
 use HwlowellRequestCache\FilterConfig;
 use HwlowellRequestCache\CacheConfig;
@@ -102,13 +101,8 @@ class RequestCache
      */
     protected function loadConfigFile()
     {
-        // 首先尝试加载包内的默认配置文件
-        $configPath = __DIR__ . '/../config/request_cache.php';
-        if (file_exists($configPath)) {
-            return require $configPath;
-        }
-
-        // 然后尝试加载 Laravel 项目根目录的配置文件
+        //先找宿主项目发布出来的配置。包内那份是兜底默认值，一定存在，
+        //先读它就等于让 vendor:publish 出来的配置永远不生效
         if (function_exists('config_path')) {
             try {
                 $configPath = config_path('request_cache.php');
@@ -116,8 +110,13 @@ class RequestCache
                     return require $configPath;
                 }
             } catch (\Throwable $e) {
-                // 忽略错误
+                //忽略错误，回落包内默认配置
             }
+        }
+
+        $configPath = __DIR__ . '/../config/request_cache.php';
+        if (file_exists($configPath)) {
+            return require $configPath;
         }
 
         return null;
@@ -180,10 +179,19 @@ class RequestCache
         $appName = self::envValue('APP_NAME', 'laravel');
         $appEnv = self::envValue('APP_ENV', 'local');
         $defaultPrefix = strtolower(str_replace(' ', '_', $appName)) . '_' . $appEnv . '_cache:';
+
+        //$prefix 的取值必须与 1.1.0 逐字节一致：?? 只在 null 时回落，显式配成 ''
+        //（用于完全不加前缀）或非字符串的都原样沿用，否则非集群部署的 key 形态会变
         $prefix = $config['request_cache']['prefix'] ?? $defaultPrefix;
 
+        //只有「非空字符串且不等于自动推导值」才算用户显式配置，需要在集群模式下
+        //保留；其余情况沿用 1.1.0 的行为，只输出 hash tag
+        $configuredPrefix = is_string($prefix) && $prefix !== '' && $prefix !== $defaultPrefix
+            ? $prefix
+            : null;
+
         if (!empty($clusterConfig['enabled'])) {
-            return self::prefixWithHashTag($prefix, $clusterConfig, $defaultPrefix);
+            return self::prefixWithHashTag($prefix, $clusterConfig, $defaultPrefix, $configuredPrefix);
         }
 
         return $prefix;
@@ -194,10 +202,15 @@ class RequestCache
      * @param string $prefix
      * @param array $clusterConfig
      * @param string $defaultPrefix
+     * @param string|null $configuredPrefix 用户显式配置的 prefix，未配置为 null
      * @return string
      */
-    protected static function prefixWithHashTag(string $prefix, array $clusterConfig, string $defaultPrefix)
-    {
+    protected static function prefixWithHashTag(
+        string $prefix,
+        array $clusterConfig,
+        string $defaultPrefix,
+        string $configuredPrefix = null
+    ) {
         if (preg_match('/\{[^{}]+\}/', $prefix)) {
             return $prefix;
         }
@@ -208,7 +221,12 @@ class RequestCache
         }
 
         $hashTag = preg_replace('/[^a-zA-Z0-9_\-:]/', '_', $hashTag);
-        return '{' . $hashTag . '}:';
+
+        //显式配置的 prefix 必须跟在 hash tag 后面保留下来。丢掉它意味着共用同一个
+        //集群、又都按文档配了 hash_tag 的多个应用会得到完全相同的 key 前缀：
+        //彼此的缓存虽然因 app.key 不同而不会互相命中，但任意一方 clearAll() 的
+        //SCAN pattern 都会连带删光另一方的缓存。
+        return '{' . $hashTag . '}:' . ($configuredPrefix ?? '');
     }
 
     /**
@@ -304,7 +322,12 @@ class RequestCache
     }
 
     /**
-     * 克隆时隔离 LocalCache 与标签状态，避免 cluster() 克隆共享进程内缓存
+     * 克隆时隔离 LocalCache，避免 cluster() 克隆共享进程内缓存
+     *
+     * 标签**不**清空：`tags('users')->cluster('gz')->set(...)` 与
+     * `cluster('gz')->tags('users')->set(...)` 都是自然写法，清空会让前者静默丢掉
+     * 标签——写入不进任何标签索引，事后 clearTags('users') 也清不掉它。标签本就是
+     * 一次性写入修饰符，由 consumeTags() 在下一次写入时取走，带进克隆不会滞留。
      */
     public function __clone()
     {
@@ -313,7 +336,6 @@ class RequestCache
             $this->cacheConfig->redisCluster(),
             $this->connectionName
         );
-        $this->tags = [];
     }
     /**
      * 获取当前实例生效的缓存配置
@@ -730,6 +752,22 @@ class RequestCache
     }
 
     /**
+     * 计算写入路径上本地缓存副本可以存活多久
+     *
+     * 写入时若直接沿用 Redis 的 TTL，常驻进程（Octane、队列 worker）会在别的
+     * 实例改写或删除 Redis 上的值之后，继续按那个 TTL 返回旧值——`set()` 传
+     * 3600 就意味着最长一小时的进程内陈旧窗口。读取路径已经用 localCacheTtl()
+     * 把副本压在 local_cache.ttl 以内，写入路径必须用同一个上限。
+     *
+     * @param int $expire Redis 上的生存秒数
+     * @return int|null
+     */
+    protected function localWriteTtl(int $expire)
+    {
+        return $this->localCacheTtl(time() + $expire);
+    }
+
+    /**
      * 过滤参数值
      * @param mixed $value
      * @return mixed
@@ -814,6 +852,22 @@ class RequestCache
     public static function sanitizeGateway(string $gateway): string
     {
         return preg_replace('/[^a-zA-Z0-9_\-]/', '', $gateway);
+    }
+
+    /**
+     * 转义 SCAN MATCH pattern 中的字面量片段
+     *
+     * pattern 由字面量（Laravel redis prefix、缓存 prefix、version）和我们自己
+     * 拼上去的 `*` 组成。字面量里如果含 `*` `?` `[` `]` `\`，Redis 会把它们当成
+     * 通配符，让 clearAll() / clearGateway() 的匹配范围超出本应用。gateway 已由
+     * sanitizeGateway() 收敛到 [A-Za-z0-9_-]，无需转义。
+     *
+     * @param string $literal
+     * @return string
+     */
+    public static function escapeGlobLiteral(string $literal): string
+    {
+        return addcslashes($literal, '*?[]\\');
     }
 
     /**
@@ -1087,13 +1141,22 @@ class RequestCache
             $redis = $this->connection();
             $result = $redis->setex($key, $expire, $jsonData);
 
+            //Redis 明确拒绝写入（OOM、只读副本等）时不抛异常，只返回 false。
+            //继续往下走会在返回 false 的同时留下本地副本和标签索引条目，
+            //shared_mode 下调用方拿到失败却仍能从本进程读到数据。
+            if ($result === false) {
+                CacheLogger::warning('Redis rejected the cache write', ['key' => $key]);
+
+                return false;
+            }
+
             //保存标签关联
             foreach ($tags as $tag) {
                 $this->touchTagIndex($redis, $this->buildTagKey($tag), $key, $expire);
             }
 
             //将数据同步到本地缓存
-            $this->localCache->set($this->localCacheKey($key), $data, $expire);
+            $this->localCache->set($this->localCacheKey($key), $data, $this->localWriteTtl($expire));
 
             return $result;
         } catch (\Throwable $e) {
@@ -1108,7 +1171,7 @@ class RequestCache
                 return false;
             }
 
-            $this->localCache->set($this->localCacheKey($key), $data, $expire);
+            $this->localCache->set($this->localCacheKey($key), $data, $this->localWriteTtl($expire));
             return true;
         }
     }
@@ -1227,7 +1290,6 @@ class RequestCache
         $results = [];
         $pipeline = null;
         $pipelineWrites = [];
-        $localWrites = [];
         $strategy = $this->cacheConfig->strategy();
         $tags = $this->consumeTags();
 
@@ -1253,9 +1315,8 @@ class RequestCache
 
                 if ($pipeline) {
                     $pipeline->setex($key, $expire, $jsonData);
-                    $pipelineWrites[] = [$key, $expire, $tags];
-                    $localWrites[$index] = [$key, $data, $expire];
-                    $results[$index] = true;
+                    //入队顺序即 exec() 返回值顺序，靠位置把响应对回原始下标
+                    $pipelineWrites[] = [$index, $key, $data, $expire, $tags];
                     continue;
                 }
 
@@ -1264,14 +1325,18 @@ class RequestCache
             }
 
             if ($pipeline) {
-                $pipeline->exec();
-                foreach ($pipelineWrites as [$key, $expire, $itemTags]) {
+                $responses = $pipeline->exec();
+                foreach ($pipelineWrites as $position => [$index, $key, $data, $expire, $itemTags]) {
+                    $results[$index] = $this->pipelineWriteSucceeded($responses, $position);
+                    if (!$results[$index]) {
+                        continue;
+                    }
+
                     foreach ($itemTags as $tag) {
                         $this->touchTagIndex($redis, $this->buildTagKey($tag), $key, $expire);
                     }
-                }
-                foreach ($localWrites as [$key, $data, $expire]) {
-                    $this->localCache->set($this->localCacheKey($key), $data, $expire);
+
+                    $this->localCache->set($this->localCacheKey($key), $data, $this->localWriteTtl($expire));
                 }
             }
         } catch (\Throwable $e) {
@@ -1296,7 +1361,7 @@ class RequestCache
                         continue;
                     }
 
-                    $this->localCache->set($this->localCacheKey($key), $data, $expire);
+                    $this->localCache->set($this->localCacheKey($key), $data, $this->localWriteTtl($expire));
                     $results[$index] = true;
                 }
                 return $results;
@@ -1310,6 +1375,28 @@ class RequestCache
         }
 
         return $results;
+    }
+
+    /**
+     * 判断管道中第 N 条写入是否成功
+     *
+     * setex 失败时 phpredis 在响应数组里放 false，predis 放状态对象；只有明确
+     * 拿到 false 才算失败。客户端不返回数组时无从判断，按成功处理——总比把
+     * 所有成功写入报成失败要好。
+     *
+     * @param mixed $responses pipeline exec() 的返回值
+     * @param int $position 命令入队位置
+     * @return bool
+     */
+    protected function pipelineWriteSucceeded($responses, int $position): bool
+    {
+        if (!is_array($responses)) {
+            return true;
+        }
+
+        $responses = array_values($responses);
+
+        return !array_key_exists($position, $responses) || $responses[$position] !== false;
     }
 
     /**
@@ -1374,11 +1461,13 @@ class RequestCache
      * @param mixed $redis
      * @param array $keys
      * @param int $batchSize
+     * @param bool|null $failed 出参：是否有批次删除失败
      * @return int
      */
-    protected function batchDeleteOnConnection($redis, array $keys, int $batchSize = 1000): int
+    protected function batchDeleteOnConnection($redis, array $keys, int $batchSize = 1000, &$failed = null): int
     {
         $deleted = 0;
+        $failed = false;
         $redisPrefix = $this->redisPrefix();
 
         //分批删除
@@ -1400,6 +1489,11 @@ class RequestCache
                 usleep(10000); // 10ms
             } catch (\Throwable $e) {
                 if (!$this->isCrossSlotException($e)) {
+                    $failed = true;
+                    CacheLogger::warning('batch delete failed', [
+                        'keys' => count($batch),
+                        'error' => $e->getMessage(),
+                    ]);
                     continue;
                 }
 
@@ -1410,7 +1504,8 @@ class RequestCache
                             : $key;
                         $deleted += $redis->del($keyWithoutPrefix);
                     } catch (\Throwable $ignored) {
-                        //忽略单 key 删除异常
+                        //单 key 删除失败不中断整批，但要让调用方知道清理不完整
+                        $failed = true;
                     }
                 }
             }
@@ -1439,18 +1534,22 @@ class RequestCache
     protected function clearByPattern(string $pattern): bool
     {
         $connections = $this->clusterNodeResolver->scanConnections();
-        $found = 0;
-        $deleted = 0;
+        $failedNodes = 0;
 
         foreach ($connections as $redis) {
-            $nodeResult = $this->scanAndDeleteOnConnection($redis, $pattern);
-            $found += $nodeResult['found'];
-            $deleted += $nodeResult['deleted'];
+            if ($this->scanAndDeleteOnConnection($redis, $pattern)['failed']) {
+                $failedNodes++;
+            }
         }
 
         $this->localCache->flush();
 
-        return $found === 0 || $deleted > 0;
+        //删除条数不作为成功判据：SCAN 命中的 key 可能在 DEL 之前就自然过期，
+        //deleted < found 并不代表清理失败。这与 clearTags() 同一套判据。
+        //但反过来，节点扫描或删除真的抛了异常就必须体现在返回值上——旧判据
+        //（found === 0 || deleted > 0）会把「第一轮 SCAN 就抛异常、一个 key 都
+        //没扫到」报成成功。
+        return $failedNodes === 0;
     }
 
     /**
@@ -1463,14 +1562,17 @@ class RequestCache
      * @param string $pattern
      * @param int $count 单轮 SCAN 的游标步长
      * @param int $batchSize 单次 DEL 的最大 key 数
-     * @return array{found:int, deleted:int}
+     * @return array{found:int, deleted:int, failed:bool}
      */
     protected function scanAndDeleteOnConnection($redis, string $pattern, int $count = 1000, int $batchSize = 1000): array
     {
         $found = 0;
         $deleted = 0;
+        $failed = false;
+        $batchFailed = false;
         $cursor = self::initialScanCursor($redis);
-        $fullPattern = $this->redisPrefix() . $pattern;
+        //$pattern 里的 `*` 是我们自己拼的通配符，Laravel 的 redis prefix 是字面量
+        $fullPattern = self::escapeGlobLiteral($this->redisPrefix()) . $pattern;
         $buffer = [];
 
         try {
@@ -1486,19 +1588,28 @@ class RequestCache
                 $found += count($result[1]);
 
                 if (count($buffer) >= $batchSize) {
-                    $deleted += $this->batchDeleteOnConnection($redis, $buffer, $batchSize);
+                    $deleted += $this->batchDeleteOnConnection($redis, $buffer, $batchSize, $batchFailed);
+                    $failed = $failed || $batchFailed;
                     $buffer = [];
                 }
             } while (!self::isScanCursorFinished($cursor));
 
             if (!empty($buffer)) {
-                $deleted += $this->batchDeleteOnConnection($redis, $buffer, $batchSize);
+                $deleted += $this->batchDeleteOnConnection($redis, $buffer, $batchSize, $batchFailed);
+                $failed = $failed || $batchFailed;
             }
         } catch (\Throwable $e) {
             //某个节点失败时保留已删除计数，由调用方按整体结果判断
+            $failed = true;
+            CacheLogger::warning('scan-and-delete failed on connection', [
+                'pattern' => $pattern,
+                'found' => $found,
+                'deleted' => $deleted,
+                'error' => $e->getMessage(),
+            ]);
         }
 
-        return ['found' => $found, 'deleted' => $deleted];
+        return ['found' => $found, 'deleted' => $deleted, 'failed' => $failed];
     }
 
     /**
@@ -1517,12 +1628,16 @@ class RequestCache
                 return false;
             }
 
+            //prefix 与 version 是字面量，其中的 glob 元字符必须转义
+            $prefix = self::escapeGlobLiteral($this->prefix);
+
             if ($allVersions) {
                 //清除所有版本的缓存
-                $pattern = $this->prefix . '*:' . $sanitizedGateway . ':*';
+                $pattern = $prefix . '*:' . $sanitizedGateway . ':*';
             } else {
                 //只清除当前版本的缓存
-                $pattern = $this->prefix . $this->version . ':' . $sanitizedGateway . ':*';
+                $pattern = $prefix . self::escapeGlobLiteral((string) $this->version)
+                    . ':' . $sanitizedGateway . ':*';
             }
             return $this->clearByPattern($pattern);
         } catch (\Throwable $e) {
@@ -1614,12 +1729,15 @@ class RequestCache
     public function clearAll(bool $allVersions = true)
     {
         try {
+            //prefix 与 version 是字面量，其中的 glob 元字符必须转义
+            $prefix = self::escapeGlobLiteral($this->prefix);
+
             if ($allVersions) {
                 //清除所有版本的缓存
-                $pattern = $this->prefix . '*';
+                $pattern = $prefix . '*';
             } else {
                 //只清除当前版本的缓存
-                $pattern = $this->prefix . $this->version . ':*';
+                $pattern = $prefix . self::escapeGlobLiteral((string) $this->version) . ':*';
             }
             return $this->clearByPattern($pattern);
         } catch (\Throwable $e) {
@@ -1710,12 +1828,17 @@ class RequestCache
      * @param string $gateway
      * @param array $params
      * @param string $key
+     * @param int|null $lockExpire 持锁者实际持有的 TTL，remember() 会传入拉长后的值
      * @return array|null 命中的缓存条目
      */
-    protected function waitForCachedEntry(string $gateway, array $params, string $key)
+    protected function waitForCachedEntry(string $gateway, array $params, string $key, int $lockExpire = null)
     {
         $lockConfig = $this->cacheConfig->lock();
-        $deadline = microtime(true) + (int) ($lockConfig['expire'] ?? 10);
+        //必须用持锁者实际的 TTL：enable_extend 会把持锁 TTL 从 lock.expire 拉长到
+        //expire + extendInterval * 5，等待方却按未拉长的值超时，就会在持锁者还在
+        //跑回调时集体放弃、各自回源——正好是本方法要防的那个场景。
+        $lockExpire = $lockExpire ?? (int) ($lockConfig['expire'] ?? 10);
+        $deadline = microtime(true) + $lockExpire;
         $interval = max(10000, (int) ($lockConfig['retryDelay'] ?? 100000));
         $lockKey = $this->buildLockKey($key);
 
@@ -1899,12 +2022,18 @@ class RequestCache
         }
 
         //抢锁失败：先等持锁者写完，实在等不到再自己回源
-        $entry = $this->waitForCachedEntry($gateway, $params, $key);
+        $entry = $this->waitForCachedEntry($gateway, $params, $key, $lockExpire);
         if ($entry !== null) {
             return $entry['data'];
         }
 
-        return $callback();
+        //回源结果同样要落缓存：不写的话，持续竞争下每个等待超时的调用方都会
+        //重复回源，且谁都不填坑，防击穿在超时之后彻底失效
+        $data = $callback();
+        $this->tags = $tags;
+        $this->set($gateway, $params, $data, $expire);
+
+        return $data;
     }
 
     /**
@@ -1956,6 +2085,16 @@ class RequestCache
         return $data;
     }
 
+    /*
+    |--------------------------------------------------------------------------
+    | RediSearch（已废弃）
+    |--------------------------------------------------------------------------
+    | RediSearchService 已从本包移除，下列所有 search* 方法只会走降级分支，
+    | 恒定返回空值（false / [] / 0）。保留它们仅为兼容既有调用方，不要在新代码
+    | 中使用；检索能力请改用 cmsig/seal + seal-redisearch-adapter，用法见
+    | RediSearch/readme.txt。
+    */
+
     /**
      * 解析 RediSearch 服务
      *
@@ -1963,6 +2102,7 @@ class RequestCache
      * search 方法沿用既有的 catch 分支返回降级值，而不是抛出调用方接不住的
      * Error（catch(\Exception) 捕获不到 Error）。
      *
+     * @deprecated 改用 cmsig/seal
      * @return mixed
      */
     protected function searchService()
@@ -1976,6 +2116,7 @@ class RequestCache
 
     /**
      * 索引文档到 RediSearch
+     * @deprecated 恒返回 false，改用 cmsig/seal
      * @param string $id
      * @param array $document
      * @return bool
@@ -1992,6 +2133,7 @@ class RequestCache
 
     /**
      * 搜索缓存内容
+     * @deprecated 恒返回空数组，改用 cmsig/seal
      * @param string $query
      * @param array $options
      * @return array
@@ -2008,6 +2150,7 @@ class RequestCache
 
     /**
      * 从搜索索引中删除文档
+     * @deprecated 恒返回 false，改用 cmsig/seal
      * @param string $id
      * @return bool
      */
@@ -2023,6 +2166,7 @@ class RequestCache
 
     /**
      * 清除搜索索引
+     * @deprecated 恒返回 false，改用 cmsig/seal
      * @return bool
      */
     public function clearSearch()
@@ -2037,6 +2181,7 @@ class RequestCache
 
     /**
      * 高级搜索
+     * @deprecated 恒返回空数组，改用 cmsig/seal
      * @param array $conditions
      * @param array $options
      * @return array
@@ -2053,6 +2198,7 @@ class RequestCache
 
     /**
      * 批量索引文档
+     * @deprecated 恒返回 false，改用 cmsig/seal
      * @param array $documents
      * @return mixed
      */
@@ -2068,6 +2214,7 @@ class RequestCache
 
     /**
      * 批量删除文档
+     * @deprecated 恒返回 false，改用 cmsig/seal
      * @param array $ids
      * @return mixed
      */
@@ -2083,6 +2230,7 @@ class RequestCache
 
     /**
      * 获取搜索文档数量
+     * @deprecated 恒返回 0，改用 cmsig/seal
      * @return int
      */
     public function countSearchDocuments()
@@ -2097,6 +2245,7 @@ class RequestCache
 
     /**
      * 检查搜索索引是否存在
+     * @deprecated 恒返回 false，改用 cmsig/seal
      * @return bool
      */
     public function existSearchIndex()
@@ -2111,6 +2260,7 @@ class RequestCache
 
     /**
      * 重建搜索索引
+     * @deprecated 恒返回 false，改用 cmsig/seal
      * @return mixed
      */
     public function rebuildSearchIndex()

@@ -2,8 +2,6 @@
 
 namespace HwlowellRequestCache;
 
-use Illuminate\Support\Facades\Config;
-
 class CacheConfig
 {
     public const SCAN_STRATEGY_SINGLE_CONNECTION = 'single_connection';
@@ -15,8 +13,7 @@ class CacheConfig
      */
     public static $strategy = [
         'primary' => 'redis', //主缓存
-        'secondary' => 'array', //备用缓存
-        'fallback' => true, //启用降级
+        'fallback' => true, //启用降级，Redis 失败时回落进程内 LocalCache
         'shared_mode' => false, //共享模式：Redis 写失败时禁止本地写入兜底
     ];
     
@@ -62,12 +59,12 @@ class CacheConfig
     
     /**
      * RediSearch 配置
+     *
+     * @deprecated 本包不再自带 RediSearchService，这里只保留 index_name 供宿主
+     *             项目自行读取；检索能力请改用 cmsig/seal 系列扩展。
      */
     public static $redisSearch = [
-        'enabled' => true, // 启用 RediSearch
         'index_name' => 'request_cache_index', // 索引名称
-        'max_results' => 1000, // 最大搜索结果数
-        'timeout_ms' => 500, // 搜索超时时间（毫秒）
     ];
 
     /**
@@ -267,6 +264,7 @@ class CacheConfig
 
     /**
      * 获取实例级 RediSearch 配置
+     * @deprecated 见 self::$redisSearch
      * @return array
      */
     public function rediSearch(): array
@@ -431,6 +429,7 @@ class CacheConfig
     
     /**
      * 获取 RediSearch 配置
+     * @deprecated 见 self::$redisSearch
      * @return array
      */
     public static function getRediSearchConfig()
@@ -440,6 +439,7 @@ class CacheConfig
     
     /**
      * 设置 RediSearch 配置
+     * @deprecated 见 self::$redisSearch
      * @param array $config
      */
     public static function setRediSearchConfig(array $config)

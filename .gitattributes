@@ -1,0 +1,7 @@
+# 开发期文件不随 composer dist 包分发；docs/ 与 RediSearch/ 保留，
+# README 与代码注释都引用了它们
+/.gitattributes    export-ignore
+/.gitignore        export-ignore
+/phpunit.xml.dist  export-ignore
+/example.php       export-ignore
+/tests/            export-ignore

@@ -170,7 +170,7 @@ class CacheMonitor
 
             //只累加数量：把整个 keyspace 的 key 收进数组再 count()，
             //在百万级缓存上会把上百万个字符串堆进 PHP 内存
-            $this->eachScannedKey($this->prefix . '*', function () use (&$count) {
+            $this->eachScannedKey(RequestCache::escapeGlobLiteral($this->prefix) . '*', function () use (&$count) {
                 $count++;
             });
 
@@ -413,7 +413,8 @@ class CacheMonitor
             $distribution = [];
 
             //边扫边聚合：内存占用取决于 version:gateway 组合数，而不是 key 总量
-            $scan = $this->eachScannedKey($this->prefix . '*', function ($key) use (&$distribution) {
+            $pattern = RequestCache::escapeGlobLiteral($this->prefix) . '*';
+            $scan = $this->eachScannedKey($pattern, function ($key) use (&$distribution) {
                 [$version, $gateway] = $this->parseCacheKeyParts($key);
                 if ($version === null || $gateway === null) {
                     return;
@@ -519,8 +520,10 @@ class CacheMonitor
             $matched = 0;
 
             try {
+                $matchPattern = RequestCache::escapeGlobLiteral($redisPrefix) . $pattern;
+
                 do {
-                    $result = $redis->scan($cursor, ['match' => $redisPrefix . $pattern, 'count' => $count]);
+                    $result = $redis->scan($cursor, ['match' => $matchPattern, 'count' => $count]);
                     if ($result === false) {
                         break;
                     }

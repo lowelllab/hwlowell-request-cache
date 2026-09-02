@@ -60,7 +60,6 @@ return [
     'cache' => [
         'strategy' => [
             'primary' => 'redis',
-            'secondary' => 'array',
             'fallback' => true,
             'shared_mode' => true,
         ],
@@ -77,7 +76,7 @@ return [
 `redis_cluster` 配置项说明：
 
 - `enabled`：是否启用 Redis Cluster 兼容模式。启用后，包会在生成缓存 key、标签 key、统计 key 和锁 key 时使用统一 hash tag，让相关 key 尽量落在同一个 slot，降低 `CROSSSLOT` 风险。
-- `hash_tag`：Redis Cluster hash tag 名称。设置为 `request-cache` 时，生成的 key 会包含类似 `{request-cache}` 的片段；为空时会使用默认的 `app_env_cache` 形式，避免不同应用或环境之间 key 冲突。
+- `hash_tag`：Redis Cluster hash tag 名称。设置为 `request-cache` 时，生成的 key 会包含类似 `{request-cache}` 的片段；为空时会使用默认的 `app_env_cache` 形式，避免不同应用或环境之间 key 冲突。若同时显式配置了 `request_cache.prefix`，该 prefix 会保留在 hash tag 之后（形如 `{request-cache}:my_app_`）。**多个应用共用同一个 Redis Cluster 时，必须给每个应用配不同的 `hash_tag` 或不同的 `prefix`**：前缀一旦相同，任意一方 `clearAll()` 的 SCAN pattern 都会连带删掉另一方的缓存。
 - `cluster_safe_mode`：是否启用集群安全模式。启用后，涉及多个 key 的操作会降级为逐 key 操作，例如 `mget`、`mset`、标签清理和批量删除，从而避免 Redis Cluster 不允许跨 slot 多 key 命令的问题。
 - `scan_strategy`：控制基于 SCAN 的清理和监控范围。默认 `single_connection` 只处理当前 Redis 连接；设置为 `all_nodes` 时，会读取宿主 Laravel 项目的 `database.redis.clusters` 节点配置，并按 `default_connection` 的名字取出对应集群的节点列表逐节点遍历。通过 `cluster()` 绑定非默认集群时，该策略强制降级为 `single_connection`。
 
@@ -651,6 +650,8 @@ $cache->clearTags('product');
 7. **Redis Cluster 全节点扫描：** `all_nodes` 依赖 Laravel 的 `database.redis.clusters` 配置；解析失败时会回退当前连接视角。
 8. **多集群前提：** `cluster()` 依赖各地集群共用同一套 `APP_KEY`、`APP_NAME`、`APP_ENV` 与缓存 `version`，否则各集群算出的缓存 key 不同，跨集群读取必然 miss。
 9. **多集群边界：** 本包只提供集群切换机制，不提供自动兜底读取顺序、不提供自动回填、不提供删除广播与跨集群一致性保证。
+10. **本地副本陈旧窗口：** 进程内副本最长存活 `cache.local_cache.ttl`（默认 300 秒）。这段时间内本进程读不到其他实例对 Redis 的改写，常驻进程（Octane、队列 worker）尤其要按业务容忍度调整该值。
+11. **RediSearch 已移除：** `search*` 系列方法恒定返回空值（`false` / `[]` / `0`），保留仅为兼容既有调用方。检索能力请改用 `cmsig/seal` + `seal-redisearch-adapter`，用法见 `RediSearch/readme.txt`。
 
 ## 配置选项
 
@@ -659,8 +660,7 @@ $cache->clearTags('product');
 ```php
 CacheConfig::$strategy = [
     'primary' => 'redis',       // 主缓存
-    'secondary' => 'array',     // 备用缓存
-    'fallback' => true,         // 是否启用兜底
+    'fallback' => true,         // Redis 失败时是否回落进程内 LocalCache
     'shared_mode' => false,     // Redis 写失败时是否禁止本地写入伪成功
 ];
 ```
@@ -690,6 +690,8 @@ CacheConfig::$localCache = [
     'size' => 1000,// 本地缓存最大条目数
 ];
 ```
+
+`ttl` 是进程内副本存活时间的**硬上限**，读写两条路径都受它约束：本地副本的实际存活时间取 `min(Redis 剩余 TTL, local_cache.ttl)`。它决定了「别的实例改写 Redis 之后，本进程最长返回多久旧值」，需要更强的跨实例一致性就调小它。
 
 ### 参数过滤配置
 
@@ -727,6 +729,32 @@ php vendor\phpunit\phpunit\phpunit tests\RequestCacheClusterTest.php --filter "C
 ```
 
 ## 更新日志
+
+### 未发布（Unreleased）
+
+> 以下变更已合入代码但尚未发版，`composer.json` 的 `version` 仍为 `1.1.0`。发版时把本节改为对应版本号。
+
+- **本地缓存副本不再超过 `local_cache.ttl`。** 此前写入路径直接沿用 Redis 的 TTL，`set(..., 3600)` 会让常驻进程（Octane、队列 worker）在别的实例改写 Redis 之后，仍按 3600 秒返回旧值。现在 `set()`、`mset()` 与两者的本地兜底写入都与读取路径共用同一个上限。
+- **集群模式下不再丢弃显式配置的 `prefix`。** 此前 `redis_cluster.enabled=true` 时 `resolvePrefix()` 直接返回 `{hash_tag}:`，把 `request_cache.prefix` 整个丢掉；共用一个集群、又都按文档配了同一个 `hash_tag` 的多个应用会得到完全相同的 key 前缀，任意一方 `clearAll()` 都会连带删光另一方的缓存。现在显式 prefix 会保留在 hash tag 之后，形如 `{request-cache}:my_app_`。
+- **`mset()` 管道路径按 `exec()` 的逐条响应返回结果。** 此前入队即记 `true` 且从不检查 `exec()` 返回值，管道内单条写入失败时调用方仍拿到 `true`；失败项现在返回 `false` 且不写入本地副本。客户端不返回逐条响应（非数组）时仍按成功处理。
+- **`set()` 同样不再忽略 `setex` 返回的 `false`。** Redis 拒绝写入（OOM、只读副本）时不抛异常，只返回 `false`，此前会在返回失败的同时照常写入标签索引和本地副本——`shared_mode=true` 的调用方拿到 `false` 却仍能从本进程读到这条数据。
+- **`remember()` 的等待窗口与持锁者实际 TTL 对齐。** `enable_extend` 会把持锁 TTL 从 `lock.expire` 拉长到 `expire + extend_interval * 5`（默认 5→15 秒），而 `waitForCachedEntry()` 一直按未拉长的 `lock.expire` 超时，导致耗时落在 5～15 秒的回调仍会击穿。**副作用：抢锁失败的调用方最长阻塞时间从 `lock.expire` 变为拉长后的 TTL**（持锁者提前释放时会立刻结束等待）；不接受这个延迟就调小 `lock.expire` / `extend_interval`，或关掉 `enable_extend`。
+- **`remember()` 在等待超时后回源的结果现在会写入缓存。** 此前直接返回不落缓存，持续竞争下每个等待超时者都重复回源且谁都不填坑。
+- **`cluster()` 不再丢掉标签。** `__clone()` 此前清空 `tags`，使 `tags('users')->cluster('gz')->set(...)` 静默写不进任何标签索引，事后 `clearTags('users')` 也清不掉它。两种链式顺序现在都生效。
+- **`clearGateway()` / `clearAll()` 的成功判据收紧为「没有节点报错」。** 旧判据是 `found === 0 || deleted > 0`，会把「第一轮 SCAN 就抛异常、一个 key 都没扫到」报成成功。删除条数仍不作为判据（SCAN 命中的 key 可能在 DEL 前自然过期），与 `clearTags()` 一致。**`all_nodes` 下只要有一个节点扫描失败就返回 `false`**，健康节点的清理不受影响，扫描与批量删除失败现在也会经 `CacheLogger` 打 warning。
+- **SCAN pattern 中的字面量片段会转义 glob 元字符。** `prefix` / `version` / Laravel redis prefix 里的 `*` `?` `[` `]` `\` 此前直接进入 `SCAN MATCH`，会让清理范围超出本应用。key 形态不受影响。
+- `vendor:publish` 出来的配置现在真正生效：`loadConfigFile()` 改为先读宿主项目的 `config/request_cache.php`，包内那份只作兜底。
+- 移除从未被任何代码读取的 `strategy.secondary`，以及 `redis_search` 中的 `enabled` / `max_results` / `timeout_ms`。
+- `search*` 系列方法与 `CacheConfig` 的 RediSearch 访问器标记为 `@deprecated`：`RediSearchService` 已不随包提供，它们恒定返回空值，检索能力请改用 `cmsig/seal`。
+- 修复 `FilterConfig::__callStatic()` 在调用未定义静态方法时无限递归导致栈溢出（该魔术方法已随同样无用的 `__staticConstruct()` 一并移除）。
+- 新增 `.gitattributes`，`tests/`、`example.php` 等开发期文件不再随 composer dist 包分发。
+
+#### 升级影响
+
+- **key 形态**：只有**同时**满足「`redis_cluster.enabled=true`」和「显式配置了非空 `request_cache.prefix`」的部署会改变，旧 key 立即 miss 并随 TTL 回收，处理方式见 [docs 第六节](./docs/v1.1.0-使用规范与注意事项.md#六形态之间切换的迁移影响)。其余部署不变。
+- **返回值语义**：`clearGateway()` / `clearAll()` 在节点报错时从 `true` 变为 `false`，`set()` / `mset()` 在 Redis 拒绝写入时从「可能为真」变为确定的 `false`。按返回值做告警的调用方会看到此前被吞掉的失败。
+- **延迟**：`remember()` 抢锁失败方的最长等待从 `lock.expire` 变为拉长后的持锁 TTL，见上。
+- **本地缓存**：若此前依赖「本地副本跟随 Redis 长 TTL」的行为，请调大 `cache.local_cache.ttl`。
 
 ### v1.1.0
 

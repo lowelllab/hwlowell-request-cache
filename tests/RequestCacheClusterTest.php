@@ -61,6 +61,46 @@ class RequestCacheClusterTest extends TestCase
         $this->assertSame('{custom}:', RequestCache::resolvePrefix($config));
     }
 
+    public function testResolvePrefixKeepsExplicitPrefixAfterHashTag()
+    {
+        $config = $this->clusterConfig([
+            'hash_tag' => 'request-cache',
+        ]);
+        $config['request_cache']['prefix'] = 'my_app_';
+
+        //显式配置的 prefix 不能被 hash tag 顶掉：两个应用共用一个集群、又都按
+        //文档配了同一个 hash_tag 时，丢掉 prefix 会让双方前缀完全相同，
+        //任意一方 clearAll() 的 SCAN pattern 都会连带删光另一方的缓存
+        $this->assertSame('{request-cache}:my_app_', RequestCache::resolvePrefix($config));
+    }
+
+    public function testResolvePrefixIgnoresEmptyConfiguredPrefix()
+    {
+        $config = $this->clusterConfig([
+            'hash_tag' => 'request-cache',
+        ]);
+        $config['request_cache']['prefix'] = '';
+
+        $this->assertSame('{request-cache}:', RequestCache::resolvePrefix($config));
+    }
+
+    public function testResolvePrefixKeepsExplicitlyEmptyPrefixOutsideCluster()
+    {
+        $config = $this->clusterConfig(['enabled' => false]);
+        $config['request_cache']['prefix'] = '';
+
+        //显式配成 '' 是「完全不加前缀」的用法，不能被自动推导的默认前缀顶回去
+        $this->assertSame('', RequestCache::resolvePrefix($config));
+    }
+
+    public function testResolvePrefixKeepsConfiguredPrefixVerbatimOutsideCluster()
+    {
+        $config = $this->clusterConfig(['enabled' => false]);
+        $config['request_cache']['prefix'] = 'my_app_';
+
+        $this->assertSame('my_app_', RequestCache::resolvePrefix($config));
+    }
+
     public function testTagStatsAndLockKeysUseSameHashTag()
     {
         $cache = new RequestCache($this->clusterConfig([
@@ -1126,8 +1166,64 @@ class RequestCacheClusterTest extends TestCase
             'scan_strategy' => 'all_nodes',
         ]));
 
-        $this->assertTrue($cache->clearGateway('users'));
+        //节点扫描失败意味着该分片没被清理，必须体现在返回值上；
+        //但不能因此阻断健康节点的清理
+        $this->assertFalse($cache->clearGateway('users'));
         $this->assertCount(1, $healthy->calls['del']);
+    }
+
+    public function testClearAllEscapesGlobMetacharactersInPrefix()
+    {
+        Config::set('database.redis.options.prefix', '');
+        $config = $this->clusterConfig(['enabled' => false]);
+        $config['request_cache']['prefix'] = 'my*app:';
+        $cache = new RequestCache($config);
+        $redis = $this->redisFake(['scan' => ['0', []]]);
+        Redis::shouldReceive('connection')->once()->andReturn($redis);
+
+        $cache->clearAll();
+
+        //prefix 里的 * 是字面量，不能被 Redis 当成通配符去匹配别的应用的 key
+        $this->assertSame('my\\*app:*', $redis->calls['scan'][0][1]['match']);
+    }
+
+    public function testTagsSurviveClusterBinding()
+    {
+        $cache = new RequestCache($this->clusterConfig([
+            'cluster_safe_mode' => true,
+            'connections' => ['default', 'gz'],
+        ]));
+        $redis = $this->redisFake([
+            'setex' => true,
+            'zadd' => 1,
+            'zremrangebyscore' => 0,
+            'expire' => true,
+        ]);
+        Redis::shouldReceive('connection')->atLeast()->once()->with('gz')->andReturn($redis);
+
+        //tags() 在前、cluster() 在后是自然写法；克隆时清空标签会让这条写入
+        //静默进不了任何标签索引，事后 clearTags('users') 也清不掉它
+        $cache->tags('users')->cluster('gz')->set('users', ['id' => 1], ['name' => 'Ada'], 60);
+
+        $this->assertArrayHasKey('zadd', $redis->calls);
+    }
+
+    public function testRememberCachesTheCallbackResultAfterTheLockWaitTimesOut()
+    {
+        $redis = $this->redisFake([
+            'get' => null,
+            'set' => false, //抢锁失败
+            'exists' => 0,  //持锁者已退出，等待立即结束
+            'setex' => true,
+        ]);
+        Redis::shouldReceive('connection')->andReturn($redis);
+        $cache = new RequestCache($this->clusterConfig(['hash_tag' => 'request-cache']));
+
+        $data = $cache->remember('users', ['id' => 1], static fn () => ['name' => 'Ada'], 60);
+
+        $this->assertSame(['name' => 'Ada'], $data);
+        //回源结果必须落缓存，否则持续竞争下每个等待超时者都会重复回源且谁都不填坑
+        $this->assertArrayHasKey('setex', $redis->calls);
     }
 
     public function testSingleConnectionClearAllKeepsCurrentConnectionBehavior()
@@ -1218,6 +1314,155 @@ class RequestCacheClusterTest extends TestCase
 
         $this->assertSame([0 => true, 1 => true], $result);
         $this->assertCount(2, $redis->calls['setex']);
+    }
+
+    public function testMsetReportsPipelineWriteFailures()
+    {
+        $cache = new RequestCache($this->clusterConfig([
+            'hash_tag' => 'request-cache',
+            'cluster_safe_mode' => false,
+        ]));
+        $pipeline = $this->redisFake([
+            'setex' => true,
+            //第二条写入被 Redis 拒绝
+            'exec' => [true, false],
+        ]);
+        $redis = $this->redisFake(['pipeline' => $pipeline]);
+        Redis::shouldReceive('connection')->atLeast()->once()->andReturn($redis);
+
+        $result = $cache->mset([
+            ['users', ['id' => 1], ['name' => 'Ada'], 60],
+            ['users', ['id' => 2], ['name' => 'Bob'], 60],
+        ]);
+
+        $this->assertSame([0 => true, 1 => false], $result);
+
+        //失败项不得留下本地副本，否则调用方拿到 false 却仍能从本进程读到数据
+        $secondKey = $cache->generateKey('users', ['id' => 2]);
+        $this->assertNull($this->localCacheFor($cache)->get($this->localCacheKeyFor($cache, $secondKey)));
+
+        $firstKey = $cache->generateKey('users', ['id' => 1]);
+        $this->assertSame(
+            ['name' => 'Ada'],
+            $this->localCacheFor($cache)->get($this->localCacheKeyFor($cache, $firstKey))
+        );
+    }
+
+    public function testMsetTreatsNonArrayPipelineResponseAsSuccess()
+    {
+        $cache = new RequestCache($this->clusterConfig([
+            'hash_tag' => 'request-cache',
+            'cluster_safe_mode' => false,
+        ]));
+        $pipeline = $this->redisFake([
+            'setex' => true,
+            'exec' => true,
+        ]);
+        $redis = $this->redisFake(['pipeline' => $pipeline]);
+        Redis::shouldReceive('connection')->atLeast()->once()->andReturn($redis);
+
+        $result = $cache->mset([
+            ['users', ['id' => 1], ['name' => 'Ada'], 60],
+        ]);
+
+        //客户端不返回逐条响应时无从判断，按成功处理好过把成功写入报成失败
+        $this->assertSame([0 => true], $result);
+    }
+
+    public function testSetReportsFailureAndSkipsSideEffectsWhenRedisRejectsTheWrite()
+    {
+        $cache = new RequestCache($this->clusterConfig([
+            'hash_tag' => 'request-cache',
+            'cluster_safe_mode' => true,
+        ]));
+        //Redis 拒绝写入（OOM、只读副本等）时只返回 false，不抛异常
+        $redis = $this->redisFake(['setex' => false]);
+        Redis::shouldReceive('connection')->atLeast()->once()->andReturn($redis);
+
+        $this->assertFalse($cache->tags('users')->set('users', ['id' => 1], ['name' => 'Ada'], 60));
+
+        //返回失败就不能留下本地副本和标签索引条目，否则 shared_mode 下调用方
+        //拿到 false 却仍能从本进程读到这条数据
+        $key = $cache->generateKey('users', ['id' => 1]);
+        $this->assertNull($this->localCacheFor($cache)->get($this->localCacheKeyFor($cache, $key)));
+        $this->assertArrayNotHasKey('zadd', $redis->calls);
+    }
+
+    public function testSetKeepsLocalCopyWithinConfiguredLocalTtl()
+    {
+        $cache = new RequestCache($this->clusterConfig([
+            'hash_tag' => 'request-cache',
+            'cluster_safe_mode' => true,
+        ], [
+            'local_cache' => [
+                'ttl' => 30,
+                'size' => 1000,
+            ],
+        ]));
+        $redis = $this->redisFake(['setex' => true]);
+        Redis::shouldReceive('connection')->atLeast()->once()->andReturn($redis);
+
+        $cache->set('users', ['id' => 1], ['name' => 'Ada'], 3600);
+
+        //本地副本必须压在 local_cache.ttl 以内，而不是跟着 Redis 的 3600 秒。
+        //否则常驻进程会在别的实例改写 Redis 之后继续返回旧值整整一小时
+        $key = $cache->generateKey('users', ['id' => 1]);
+        $expiresAt = $this->localCacheExpiresFor($cache, $this->localCacheKeyFor($cache, $key));
+
+        $this->assertNotNull($expiresAt);
+        $this->assertLessThanOrEqual(time() + 30, $expiresAt);
+    }
+
+    public function testSetKeepsLocalCopyShorterThanRedisTtlWhenRedisTtlIsSmaller()
+    {
+        $cache = new RequestCache($this->clusterConfig([
+            'hash_tag' => 'request-cache',
+            'cluster_safe_mode' => true,
+        ], [
+            'local_cache' => [
+                'ttl' => 300,
+                'size' => 1000,
+            ],
+        ]));
+        $redis = $this->redisFake(['setex' => true]);
+        Redis::shouldReceive('connection')->atLeast()->once()->andReturn($redis);
+
+        $cache->set('users', ['id' => 1], ['name' => 'Ada'], 10);
+
+        $key = $cache->generateKey('users', ['id' => 1]);
+        $expiresAt = $this->localCacheExpiresFor($cache, $this->localCacheKeyFor($cache, $key));
+
+        $this->assertNotNull($expiresAt);
+        $this->assertLessThanOrEqual(time() + 10, $expiresAt);
+    }
+
+    public function testMsetKeepsLocalCopyWithinConfiguredLocalTtl()
+    {
+        $cache = new RequestCache($this->clusterConfig([
+            'hash_tag' => 'request-cache',
+            'cluster_safe_mode' => false,
+        ], [
+            'local_cache' => [
+                'ttl' => 30,
+                'size' => 1000,
+            ],
+        ]));
+        $pipeline = $this->redisFake([
+            'setex' => true,
+            'exec' => [true],
+        ]);
+        $redis = $this->redisFake(['pipeline' => $pipeline]);
+        Redis::shouldReceive('connection')->atLeast()->once()->andReturn($redis);
+
+        $cache->mset([
+            ['users', ['id' => 1], ['name' => 'Ada'], 3600],
+        ]);
+
+        $key = $cache->generateKey('users', ['id' => 1]);
+        $expiresAt = $this->localCacheExpiresFor($cache, $this->localCacheKeyFor($cache, $key));
+
+        $this->assertNotNull($expiresAt);
+        $this->assertLessThanOrEqual(time() + 30, $expiresAt);
     }
 
     public function testMsetPreservesCrossSlotRedisDowngrade()
@@ -2316,7 +2561,6 @@ class RequestCacheClusterTest extends TestCase
             'cache' => array_replace_recursive([
                 'strategy' => [
                     'primary' => 'redis',
-                    'secondary' => 'array',
                     'fallback' => true,
                     'shared_mode' => false,
                 ],
@@ -2373,6 +2617,16 @@ class RequestCacheClusterTest extends TestCase
         $property->setAccessible(true);
 
         return $property->getValue($cache);
+    }
+
+    private function localCacheExpiresFor(RequestCache $cache, string $localKey)
+    {
+        $localCache = $this->localCacheFor($cache);
+        $reflection = new ReflectionClass($localCache);
+        $property = $reflection->getProperty('expires');
+        $property->setAccessible(true);
+
+        return $property->getValue($localCache)[$localKey] ?? null;
     }
 
     private function localCacheKeyFor(RequestCache $cache, string $key): string

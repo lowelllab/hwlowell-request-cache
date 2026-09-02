@@ -183,25 +183,6 @@ class FilterConfig
     }
 
     /**
-     * 静态构造函数
-     */
-    public static function __staticConstruct()
-    {
-        self::init();
-    }
-
-    /**
-     * 调用静态方法时自动初始化
-     */
-    public static function __callStatic($name, $arguments)
-    {
-        if (!isset(self::$allowedCharsPattern)) {
-            self::init();
-        }
-        return call_user_func_array([self::class, $name], $arguments);
-    }
-
-    /**
      * 是否移除 HTML 标签
      */
     public static $removeHtmlTags = true;

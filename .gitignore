@@ -1,7 +1,8 @@
 vendor/
-/
 .env
 composer.lock
 .idea/
+.phpunit.result.cache
+coverage/
 Services/RediSearch/debug.log
 spec/
