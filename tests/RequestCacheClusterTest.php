@@ -48,7 +48,50 @@ class RequestCacheClusterTest extends TestCase
 
         $key = $cache->generateKey('user profile', ['id' => 1]);
 
-        $this->assertStringStartsWith('{request-cache}:2.0:userprofile:', $key);
+        $this->assertStringStartsWith(
+            '{request-cache}:2.0:' . RequestCache::sanitizeGateway('user profile') . ':',
+            $key
+        );
+        $this->assertStringStartsWith('{request-cache}:2.0:userprofile-', $key);
+    }
+
+    public function testDistinctGatewaysThatSanitiseAliveGenerateDistinctKeys()
+    {
+        $cache = new RequestCache($this->clusterConfig([
+            'hash_tag' => 'request-cache',
+        ]));
+        $params = ['id' => 1];
+
+        //清洗有损：这些 gateway 的可读片段全都塌缩成同一个串（或空串），
+        //只有原始串指纹能把它们区分开，否则不同接口互相读到对方的缓存
+        $keys = [
+            $cache->generateKey('user.profile', $params),
+            $cache->generateKey('userprofile', $params),
+            $cache->generateKey('user profile', $params),
+            $cache->generateKey('订单详情', $params),
+            $cache->generateKey('用户详情', $params),
+            $cache->generateKey('', $params),
+        ];
+
+        $this->assertCount(count($keys), array_unique($keys));
+    }
+
+    public function testSanitizedGatewayStaysGlobSafeAndClearable()
+    {
+        //指纹只含 hex，可读片段仍限于 [A-Za-z0-9_-]，不会把通配符带进 SCAN pattern
+        foreach (['user.profile', '订单详情', 'a*b?c[d]', ''] as $gateway) {
+            $this->assertMatchesRegularExpression(
+                '/^[A-Za-z0-9_\-]+$/',
+                RequestCache::sanitizeGateway($gateway)
+            );
+        }
+
+        //非 ASCII gateway 过去被清成空串，clearGateway() 直接返回 false 清不掉
+        $this->assertNotSame('', RequestCache::sanitizeGateway('订单详情'));
+        $this->assertNotSame(
+            RequestCache::sanitizeGateway('订单详情'),
+            RequestCache::sanitizeGateway('用户详情')
+        );
     }
 
     public function testResolvePrefixKeepsExistingHashTag()
@@ -1249,7 +1292,7 @@ class RequestCacheClusterTest extends TestCase
         ]));
         $redis = $this->redisFake([
             'get' => function ($key) {
-                return str_contains($key, ':users:')
+                return str_contains($key, ':' . RequestCache::sanitizeGateway('users') . ':')
                     ? json_encode(['source' => 'redis'])
                     : null;
             },
@@ -1562,7 +1605,8 @@ class RequestCacheClusterTest extends TestCase
         $this->assertNull($this->connectionNameFor($cache));
         $this->assertSame('gz', $this->connectionNameFor($bound));
         $this->assertNotSame($this->clusterResolverFor($cache), $this->clusterResolverFor($bound));
-        $this->assertNotSame($this->localCacheFor($cache), $this->localCacheFor($bound));
+        //LocalCache 由所有克隆共用，隔离靠 localCacheKey() 的连接名命名空间
+        $this->assertSame($this->localCacheFor($cache), $this->localCacheFor($bound));
 
         $bound->tags(['users']);
         $reflection = new ReflectionClass($cache);
@@ -1803,7 +1847,8 @@ class RequestCacheClusterTest extends TestCase
         $cache = (new RequestCache($this->clusterConfig([
             'connections' => ['default', 'gz'],
         ])))->cluster('gz');
-        $cache->enableStats(true);
+        //enableStats() 返回克隆，必须接住返回值
+        $cache = $cache->enableStats(true);
         $reflection = new ReflectionClass($cache);
         $method = $reflection->getMethod('recordStats');
         $method->setAccessible(true);
@@ -1825,7 +1870,7 @@ class RequestCacheClusterTest extends TestCase
             'default_connection' => 'gz',
             'connections' => ['default', 'gz'],
         ]));
-        $cache->enableStats(true);
+        $cache = $cache->enableStats(true);
         $reflection = new ReflectionClass($cache);
         $method = $reflection->getMethod('recordStats');
         $method->setAccessible(true);
@@ -2024,7 +2069,7 @@ class RequestCacheClusterTest extends TestCase
         $this->assertCount(1, $defaultRedis->calls['get']);
     }
 
-    public function testLocalCacheIsolationGivesEachClusterCloneItsOwnLocalCache()
+    public function testLocalCacheIsolationSharesOneStoreAcrossClusterClones()
     {
         $cache = new RequestCache($this->clusterConfig([
             'connections' => ['default', 'gz', 'hk'],
@@ -2033,15 +2078,46 @@ class RequestCacheClusterTest extends TestCase
         $hk = $cache->cluster('hk');
         $key = $cache->generateKey('users', ['id' => 1]);
 
-        $this->assertNotSame($this->localCacheFor($cache), $this->localCacheFor($gz));
-        $this->assertNotSame($this->localCacheFor($gz), $this->localCacheFor($hk));
+        //克隆共用同一个进程内缓存：每个克隆各建一份的话，链式调用写进去的本地
+        //副本会随克隆一起被丢弃，delete() 也清不掉别的实例持有的副本
+        $this->assertSame($this->localCacheFor($cache), $this->localCacheFor($gz));
+        $this->assertSame($this->localCacheFor($gz), $this->localCacheFor($hk));
 
         $this->localCacheFor($gz)->set($this->localCacheKeyFor($gz, $key), ['region' => 'gz']);
         $this->localCacheFor($hk)->set($this->localCacheKeyFor($hk, $key), ['region' => 'hk']);
 
+        //隔离由 key 的连接名命名空间保证，而不是各自一份存储
         $this->assertSame(['region' => 'gz'], $this->localCacheFor($gz)->get($this->localCacheKeyFor($gz, $key)));
-        $this->assertNull($this->localCacheFor($hk)->get($this->localCacheKeyFor($gz, $key)));
         $this->assertSame(['region' => 'hk'], $this->localCacheFor($hk)->get($this->localCacheKeyFor($hk, $key)));
+        $this->assertNotSame(
+            $this->localCacheKeyFor($gz, $key),
+            $this->localCacheKeyFor($hk, $key)
+        );
+    }
+
+    public function testChainedModifiersReturnClonesAndLeaveTheOriginalUntouched()
+    {
+        $cache = new RequestCache($this->clusterConfig([
+            'connections' => ['default', 'gz'],
+        ]));
+
+        //request-cache 注册为容器单例，这些修饰符若写在 $this 上就会跨调用粘连，
+        //在 Octane / 队列 worker 里更会跨请求泄漏
+        $this->assertNotSame($cache, $cache->version('9.9'));
+        $this->assertNotSame($cache, $cache->sizeLimit(16));
+        $this->assertNotSame($cache, $cache->encryptData(true));
+        $this->assertNotSame($cache, $cache->enableStats(false));
+        $this->assertNotSame($cache, $cache->tags(['users']));
+
+        $baseline = $cache->generateKey('users', ['id' => 1]);
+        $cache->version('9.9');
+        $cache->sizeLimit(16);
+
+        $this->assertSame($baseline, $cache->generateKey('users', ['id' => 1]));
+        $this->assertStringContainsString(':2.0:', $baseline);
+        $this->assertStringContainsString(':9.9:', $cache->version('9.9')->generateKey('users', ['id' => 1]));
+        $this->assertSame([], $this->tagsFor($cache));
+        $this->assertSame(['users'], $this->tagsFor($cache->tags(['users'])));
     }
 
     public function testLocalCacheIsolationHashesEffectiveConnectionName()
@@ -2568,6 +2644,143 @@ class RequestCacheClusterTest extends TestCase
         $this->assertDoesNotMatchRegularExpression('/cluster\s+(?:nodes|slots|shards)/i', $smoke);
     }
 
+    public function testDeleteReportsSuccessWhenTheKeyWasAlreadyGone()
+    {
+        $cache = new RequestCache($this->clusterConfig());
+        //DEL 返回 0 只说明 key 已自然过期，不代表删除失败；与
+        //clearGateway()/clearTags() 保持同一套成功判据
+        $redis = $this->redisFake(['del' => 0]);
+        Redis::shouldReceive('connection')->once()->andReturn($redis);
+
+        $this->assertTrue($cache->delete('users', ['id' => 1]));
+        $this->assertCount(1, $redis->calls['del']);
+    }
+
+    public function testDeleteReportsFailureOnlyWhenRedisThrows()
+    {
+        $cache = new RequestCache($this->clusterConfig());
+        $redis = $this->redisFake([
+            'del' => function () {
+                throw new \RuntimeException('connection lost');
+            },
+        ]);
+        Redis::shouldReceive('connection')->once()->andReturn($redis);
+
+        $this->assertFalse($cache->delete('users', ['id' => 1]));
+    }
+
+    public function testClearGatewayFlushesOnlyTheBoundConnectionLocalNamespace()
+    {
+        $cache = new RequestCache($this->clusterConfig([
+            'scan_strategy' => 'single_connection',
+            'connections' => ['default', 'gz'],
+        ]));
+        $bound = $cache->cluster('gz');
+        $key = $cache->generateKey('users', ['id' => 1]);
+        $redis = $this->redisFake(['scan' => ['0', []]]);
+        Redis::shouldReceive('connection')->once()->with('gz')->andReturn($redis);
+
+        $store = $this->localCacheFor($cache);
+        $store->set($this->localCacheKeyFor($cache, $key), ['region' => 'default']);
+        $store->set($this->localCacheKeyFor($bound, $key), ['region' => 'gz']);
+
+        $this->assertTrue($bound->clearGateway('users'));
+
+        //共用一个 LocalCache，但清理只作用于被绑定连接的命名空间，
+        //不把其它集群仍然有效的本地副本一起丢掉
+        $this->assertNull($store->get($this->localCacheKeyFor($bound, $key)));
+        $this->assertSame(['region' => 'default'], $store->get($this->localCacheKeyFor($cache, $key)));
+    }
+
+    public function testKeyDistributionShapeDoesNotDependOnScanStrategy()
+    {
+        $redis = $this->redisFake([
+            'scan' => ['0', ['{request-cache}:2.0:users:first']],
+        ]);
+        Redis::shouldReceive('connection')->once()->andReturn($redis);
+        $monitor = new CacheMonitor($this->clusterConfig([
+            'hash_tag' => 'request-cache',
+            'scan_strategy' => 'single_connection',
+        ]));
+
+        $distribution = $monitor->getKeyDistribution();
+
+        //过去 single_connection 直接返回扁平的 version=>gateway=>count，
+        //调用方没法用同一套代码同时消费两种策略的返回值
+        $this->assertSame('current_connection', $distribution['scope']);
+        $this->assertSame(1, $distribution['distribution']['2.0']['users']);
+        $this->assertArrayHasKey('nodes', $distribution);
+        $this->assertArrayHasKey('failed_nodes', $distribution);
+    }
+
+    public function testMonitorSkipsBookkeepingKeysWhenCountingAndGrouping()
+    {
+        $keys = [
+            '{request-cache}:2.0:users:first',
+            '{request-cache}:stats:hits',
+            '{request-cache}:stats:hits:2026-09-02',
+            '{request-cache}:tags:users',
+            '{request-cache}:lock:' . hash('sha256', 'x'),
+        ];
+        $redis = $this->redisFake(['scan' => ['0', $keys]]);
+        Redis::shouldReceive('connection')->twice()->andReturn($redis, $redis);
+        $monitor = new CacheMonitor($this->clusterConfig([
+            'hash_tag' => 'request-cache',
+            'scan_strategy' => 'single_connection',
+        ]));
+
+        //统计/标签/锁与缓存值同前缀，算进来会虚报缓存条目数
+        $this->assertSame(1, $monitor->getCacheKeyCount());
+        $this->assertSame(
+            ['2.0' => ['users' => 1]],
+            $monitor->getKeyDistribution()['distribution']
+        );
+    }
+
+    public function testMonitorMemoryReadPassesAClusterRouteKeyOnSingleConnection()
+    {
+        $redis = $this->redisFake(['info' => ['used_memory' => 1024]]);
+        Redis::shouldReceive('connection')->once()->andReturn($redis);
+        $monitor = new CacheMonitor($this->clusterConfig([
+            'hash_tag' => 'request-cache',
+            'scan_strategy' => 'single_connection',
+        ]));
+
+        $monitor->getMemoryUsage();
+
+        //不传路由 key 时适配器会退回硬编码的 {request-cache}:ping，
+        //读数来自与本应用 hash_tag 无关的节点
+        $this->assertSame([['memory']], $redis->calls['info']);
+    }
+
+    public function testFloatValuesKeepTheirTypeThroughTheEnvelope()
+    {
+        $cache = new RequestCache($this->clusterConfig());
+        $reflection = new ReflectionClass($cache);
+        $encode = $reflection->getMethod('encodeStoredValue');
+        $encode->setAccessible(true);
+        $decode = $reflection->getMethod('decodeStoredValue');
+        $decode->setAccessible(true);
+
+        $encoded = $encode->invoke($cache, ['price' => 1251.0, 'qty' => 2], 60);
+        $entry = $decode->invoke($cache, $encoded);
+
+        //缺少 JSON_PRESERVE_ZERO_FRACTION 时 1251.0 会被写成 1251，读回来变成 int
+        $this->assertIsFloat($entry['data']['price']);
+        $this->assertSame(1251.0, $entry['data']['price']);
+        $this->assertIsInt($entry['data']['qty']);
+    }
+
+    public function testParamsThatDifferOnlyInNumericTypeGenerateDistinctKeys()
+    {
+        $cache = new RequestCache($this->clusterConfig());
+
+        $this->assertNotSame(
+            $cache->generateKey('users', ['id' => 1]),
+            $cache->generateKey('users', ['id' => 1.0])
+        );
+    }
+
     private function clusterConfig(array $clusterOverrides = [], array $cacheOverrides = [])
     {
         return [
@@ -2633,6 +2846,15 @@ class RequestCacheClusterTest extends TestCase
     {
         $reflection = new ReflectionClass($cache);
         $property = $reflection->getProperty('connectionName');
+        $property->setAccessible(true);
+
+        return $property->getValue($cache);
+    }
+
+    private function tagsFor(RequestCache $cache)
+    {
+        $reflection = new ReflectionClass($cache);
+        $property = $reflection->getProperty('tags');
         $property->setAccessible(true);
 
         return $property->getValue($cache);

@@ -163,23 +163,11 @@ class RedisClientAdapter
     }
 
     /**
-     * SCAN 初始游标：phpredis 要求 null，而不是 '0'
-     * @return null
+     * 集群路由兜底 key
+     *
+     * 只在调用方没传 routeKey 时使用。它与应用配置的 hash_tag 无关，因此落到
+     * 的节点是任意的——需要读特定节点时必须显式传 routeKey。
      */
-    public static function initialScanCursor()
-    {
-        return null;
-    }
-
-    /**
-     * @param mixed $cursor
-     * @return bool
-     */
-    public static function isScanCursorFinished($cursor): bool
-    {
-        return $cursor === 0 || $cursor === '0' || $cursor === null;
-    }
-
     protected function defaultRouteKey(): string
     {
         return '{request-cache}:ping';

@@ -170,7 +170,12 @@ class CacheMonitor
 
             //只累加数量：把整个 keyspace 的 key 收进数组再 count()，
             //在百万级缓存上会把上百万个字符串堆进 PHP 内存
-            $this->eachScannedKey(RequestCache::escapeGlobLiteral($this->prefix) . '*', function () use (&$count) {
+            $this->eachScannedKey(RequestCache::escapeGlobLiteral($this->prefix) . '*', function ($key) use (&$count) {
+                //统计/标签/锁与缓存值同前缀，算进来会虚报缓存条目数
+                if ($this->isBookkeepingKey($key)) {
+                    return;
+                }
+
                 $count++;
             });
 
@@ -188,7 +193,9 @@ class CacheMonitor
     {
         try {
             if (!$this->clusterNodeResolver->isAllNodesStrategy()) {
-                $info = RedisClientAdapter::wrap($this->connection())->info('memory');
+                //必须带上路由 key：集群上不传时适配器会退回硬编码的
+                //{request-cache}:ping，读数来自与本应用 hash_tag 无关的节点
+                $info = RedisClientAdapter::wrap($this->connection())->info('memory', $this->prefix . 'ping');
                 return array_merge(['scope' => 'current_connection'], $this->normalizeMemoryInfo($info));
             }
 
@@ -405,6 +412,11 @@ class CacheMonitor
 
     /**
      * 获取缓存键分布
+     *
+     * 返回结构与 scan_strategy 无关：过去 single_connection 直接返回扁平的
+     * version=>gateway=>count，all_nodes 返回带 scope/nodes 的包装结构，调用方
+     * 没法用同一套代码消费。现在两种策略都返回包装结构。
+     *
      * @return array
      */
     public function getKeyDistribution()
@@ -420,16 +432,17 @@ class CacheMonitor
                     return;
                 }
 
+                //统计/标签/锁不是缓存条目，不应占据一个 version 分组
+                if ($this->isBookkeepingSegment($version)) {
+                    return;
+                }
+
                 if (!isset($distribution[$version][$gateway])) {
                     $distribution[$version][$gateway] = 0;
                 }
 
                 $distribution[$version][$gateway]++;
             });
-
-            if (!$this->clusterNodeResolver->isAllNodesStrategy()) {
-                return $distribution;
-            }
 
             return [
                 'scope' => $scan['scope'],
@@ -438,8 +451,45 @@ class CacheMonitor
                 'failed_nodes' => $scan['failed_nodes'],
             ];
         } catch (\Throwable $e) {
-            return [];
+            return [
+                'scope' => 'current_connection',
+                'distribution' => [],
+                'nodes' => [],
+                'failed_nodes' => [],
+                'error' => $e->getMessage(),
+            ];
         }
+    }
+
+    /**
+     * 簿记 key 的首段：统计、标签索引、分布式锁
+     */
+    protected const BOOKKEEPING_SEGMENTS = ['stats', 'tags', 'lock'];
+
+    /**
+     * 判断扫到的 key 是簿记 key 而非缓存条目
+     *
+     * 缓存值形如 `<prefix><version>:<gateway>:<hash>`，簿记 key 形如
+     * `<prefix>stats:*`、`<prefix>tags:*`、`<prefix>lock:*`，两者同前缀，
+     * 只能靠首段区分。
+     *
+     * @param string $key
+     * @return bool
+     */
+    protected function isBookkeepingKey(string $key): bool
+    {
+        [$version] = $this->parseCacheKeyParts($key);
+
+        return $version !== null && $this->isBookkeepingSegment($version);
+    }
+
+    /**
+     * @param string $segment
+     * @return bool
+     */
+    protected function isBookkeepingSegment(string $segment): bool
+    {
+        return in_array($segment, self::BOOKKEEPING_SEGMENTS, true);
     }
 
     /**
@@ -462,6 +512,9 @@ class CacheMonitor
 
     /**
      * 清理过期缓存
+     *
+     * @deprecated 空实现，恒定返回 0。Redis 依 TTL 自行淘汰，标签索引的过期成员
+     *             由每次写入时的 touchTagIndex() 按 score 剔除，无需外部触发。
      * @return int
      */
     public function cleanExpired()

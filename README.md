@@ -734,6 +734,12 @@ php vendor\phpunit\phpunit\phpunit tests\RequestCacheClusterTest.php --filter "C
 
 > 以下变更已合入代码但尚未发版，`composer.json` 的 `version` 仍为 `1.1.0`。发版时把本节改为对应版本号。
 
+- **不同 gateway 不再算出同一个缓存 key。** `generateKey()` 把 gateway 交给 `sanitizeGateway()` 清洗后才参与 HMAC，而参数有原始指纹兜底、gateway 没有。清洗是有损的：`user.profile` 与 `userprofile` 塌缩成同一个片段，**任何非 ASCII 名字（含全中文 gateway）被清成空串**，于是不同接口只要参数相同就算出完全相同的 key、互相读到对方的数据；这类缓存还清不掉，因为 `clearGateway()` 见到空 gateway 直接返回 `false`。现在可读片段后固定追加一段原始串指纹（形如 `userprofile-0e2b86d606d7`），`clearGateway()` 复用同一函数，因此仍能精确命中单个 gateway 而不会误清同名塌缩的其它 gateway。
+- **`version()` / `sizeLimit()` / `encryptData()` / `enableStats()` / `tags()` 改为返回克隆。** `request-cache` 注册为容器单例，而这些修饰符此前写在 `$this` 上并返回 `$this`，只有 `cluster()` 返回克隆。一次 `RequestCache::version('v2')->get(...)` 之后，后续所有无关调用都停在 `v2`；在 Octane 或队列 worker 里单例跨请求存活，等于一次链式调用污染整个 worker 的后续请求。**调用方必须接住返回值**（`$c = $c->enableStats(true)`），丢弃返回值的写法不再生效。
+- **各克隆共用同一个 `LocalCache`，清理只作用于当前连接的命名空间。** 修饰符改为克隆后，若每个克隆各建一份进程内缓存，`tags('users')->set(...)` 写进去的本地副本会随克隆一起被丢弃，`cluster('gz')->delete(...)` 也清不掉别的实例持有的副本。现在克隆沿用同一个存储，隔离仍由 `localCacheKey()` 的连接名命名空间保证；`clearGateway()` / `clearTags()` / `clearAll()` 改为按该命名空间清理，不再把其它集群仍然有效的本地副本一起丢掉。
+- **`delete()` 不再拿删除条数当成功判据。** 此前 `del($key) > 0`，key 已自然过期时返回 `false`，与明确不按条数判定的 `clearGateway()` / `clearTags()` 相左。现在只有 Redis 异常才返回 `false`。
+- **浮点值经缓存往返后保持类型。** 信封与参数指纹的 `json_encode` 补上 `JSON_PRESERVE_ZERO_FRACTION`：此前写 `1.0` 读回来是 `int(1)`，嵌套里的 `1251.0` 同样退化；参数 `['id' => 1]` 与 `['id' => 1.0]` 也会算出同一个 key。
+- **`CacheMonitor` 的口径修正。** `getKeyDistribution()` 的返回结构不再随 `scan_strategy` 变化（过去 `single_connection` 返回扁平的 `version=>gateway=>count`、`all_nodes` 返回带 `scope`/`nodes` 的包装结构，调用方无法用同一套代码消费），两种策略统一返回包装结构；`getCacheKeyCount()` 与 `getKeyDistribution()` 排除 `stats:` / `tags:` / `lock:` 这些与缓存值同前缀的簿记 key，此前它们被算作缓存条目、并占据一个 `version` 分组；`single_connection` 下读内存时补上集群路由 key，此前退回适配器硬编码的 `{request-cache}:ping`，读数来自与本应用 `hash_tag` 无关的节点。
 - **本地缓存副本不再超过 `local_cache.ttl`。** 此前写入路径直接沿用 Redis 的 TTL，`set(..., 3600)` 会让常驻进程（Octane、队列 worker）在别的实例改写 Redis 之后，仍按 3600 秒返回旧值。现在 `set()`、`mset()` 与两者的本地兜底写入都与读取路径共用同一个上限。
 - **集群模式下不再丢弃显式配置的 `prefix`。** 此前 `redis_cluster.enabled=true` 时 `resolvePrefix()` 直接返回 `{hash_tag}:`，把 `request_cache.prefix` 整个丢掉；共用一个集群、又都按文档配了同一个 `hash_tag` 的多个应用会得到完全相同的 key 前缀，任意一方 `clearAll()` 都会连带删光另一方的缓存。现在显式 prefix 会保留在 hash tag 之后，形如 `{request-cache}:my_app_`。
 - **`mset()` 管道路径按 `exec()` 的逐条响应返回结果。** 此前入队即记 `true` 且从不检查 `exec()` 返回值，管道内单条写入失败时调用方仍拿到 `true`；失败项现在返回 `false` 且不写入本地副本。客户端不返回逐条响应（非数组）时仍按成功处理。返回数组的下标顺序保证与入参一致——管道结果要等 `exec()` 之后才回填，而超出 `size_limit` 或非 UTF-8 的条目在那之前就已失败，两者混在一批里时不重排会让 `array_values()`、`===` 比较或 `array_combine($ids, $results)` 这类用法静默错位。
@@ -747,12 +753,15 @@ php vendor\phpunit\phpunit\phpunit tests\RequestCacheClusterTest.php --filter "C
 - 移除从未被任何代码读取的 `strategy.secondary`，以及 `redis_search` 中的 `enabled` / `max_results` / `timeout_ms`。
 - `search*` 系列方法与 `CacheConfig` 的 RediSearch 访问器标记为 `@deprecated`：`RediSearchService` 已不随包提供，它们恒定返回空值，检索能力请改用 `cmsig/seal`。
 - 修复 `FilterConfig::__callStatic()` 在调用未定义静态方法时无限递归导致栈溢出（该魔术方法已随同样无用的 `__staticConstruct()` 一并移除）。
-- 新增 `.gitattributes`，`tests/`、`example.php` 等开发期文件不再随 composer dist 包分发。
+- 新增 `.gitattributes`，`tests/`、`example.php`、`spec/` 等开发期文件不再随 composer dist 包分发。
+- 移除 `illuminate/http` 依赖（包内已无任何引用），以及 `RedisClientAdapter` 中无人调用的 `initialScanCursor()` / `isScanCursorFinished()`；`CacheMonitor::cleanExpired()` 标记为 `@deprecated`（空实现，恒返回 0）。
 
 #### 升级影响
 
-- **key 形态**：只有**同时**满足「`redis_cluster.enabled=true`」和「显式配置了非空 `request_cache.prefix`」的部署会改变，旧 key 立即 miss 并随 TTL 回收，处理方式见 [docs 第六节](./docs/v1.1.0-使用规范与注意事项.md#六形态之间切换的迁移影响)。其余部署不变。
-- **返回值语义**：`clearGateway()` / `clearAll()` 在节点报错时从 `true` 变为 `false`，`set()` / `mset()` 在 Redis 拒绝写入时从「可能为真」变为确定的 `false`。按返回值做告警的调用方会看到此前被吞掉的失败。
+- **key 形态（全量变化）**：gateway 片段追加了原始串指纹，因此**所有缓存 key 都会改变**。旧 key 立即 miss 并随 TTL 自然回收，无需手工清理；升级瞬间会有一波回源，建议在低峰期发布，或先按 [docs 第六节](./docs/v1.1.0-使用规范与注意事项.md#六形态之间切换的迁移影响)预热。`clearGateway()` 只能清理新形态的 key，旧形态的残留靠 TTL 或 `clearAll()`。参数指纹改用 `JSON_PRESERVE_ZERO_FRACTION` 同样会改变含浮点参数的 key。
+- **调用方必须接住链式返回值**：`version()` / `sizeLimit()` / `encryptData()` / `enableStats()` / `tags()` 现在返回克隆。`$cache->enableStats(true); $cache->set(...)` 这种丢弃返回值的写法不再生效，需改成 `$cache = $cache->enableStats(true);` 或直接链到终端方法上。
+- **返回值语义**：`clearGateway()` / `clearAll()` 在节点报错时从 `true` 变为 `false`，`set()` / `mset()` 在 Redis 拒绝写入时从「可能为真」变为确定的 `false`，`delete()` 在 key 已不存在时从 `false` 变为 `true`。按返回值做告警的调用方会看到差异。
+- **监控返回结构**：`getKeyDistribution()` 在 `single_connection` 下由扁平结构变为 `['scope', 'distribution', 'nodes', 'failed_nodes']`，按 `foreach ($dist as $version => $gateways)` 消费的代码需改读 `$dist['distribution']`。`getCacheKeyCount()` 的数值会比升级前变小（不再计入簿记 key）。
 - **延迟**：`remember()` 抢锁失败方的最长等待从 `lock.expire` 变为拉长后的持锁 TTL，见上。
 - **本地缓存**：若此前依赖「本地副本跟随 Redis 长 TTL」的行为，请调大 `cache.local_cache.ttl`。
 

@@ -133,6 +133,37 @@ class LocalCache
         $this->expires = [];
         return true;
     }
+
+    /**
+     * 只清除某个前缀下的缓存
+     *
+     * 所有实例共用同一个进程内缓存，key 按连接名分了命名空间。集群 A 的清理
+     * 不应顺手把集群 B 仍然有效的本地副本一起丢掉，因此按前缀清。
+     *
+     * @param string $prefix
+     * @return bool
+     */
+    public function flushPrefix(string $prefix)
+    {
+        if ($prefix === '') {
+            return $this->flush();
+        }
+
+        foreach (array_keys($this->cache) as $key) {
+            if (str_starts_with($key, $prefix)) {
+                unset($this->cache[$key], $this->expires[$key]);
+            }
+        }
+
+        //过期表里可能残留没有对应值的条目
+        foreach (array_keys($this->expires) as $key) {
+            if (str_starts_with($key, $prefix)) {
+                unset($this->expires[$key]);
+            }
+        }
+
+        return true;
+    }
     
     /**
      * 清除过期缓存

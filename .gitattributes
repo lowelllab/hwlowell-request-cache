@@ -5,3 +5,4 @@
 /phpunit.xml.dist  export-ignore
 /example.php       export-ignore
 /tests/            export-ignore
+/spec/             export-ignore
